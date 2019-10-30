@@ -1,0 +1,7 @@
+.idea/
+.vscode/
+build/
+venv/
+result/
+json/
+diff-stream-fixed-data-size/
