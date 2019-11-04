@@ -1,6 +1,9 @@
 # coding: utf-8
 
-from urllib.parse import unquote
+import re
+from multiprocessing import Pool
+from subprocess import Popen, PIPE
+from urllib.parse import urlparse
 
 from python.json_util import read_json_file
 
@@ -18,10 +21,9 @@ har_converter 的作用是把 chrome devtools 导出的 har 格式 json 文件�
 
 def get_filtered_entries(original_entries, root_request):
   """
-  本方法从日志记录中提取所有发送过的 http/https url 地址，用于从 entries 列表中筛选出
-  所有 http/https 请求
+  本方法把原始记录的每一项中提取有用数据，并返回只包含筛选后的字段的 entry 列表
 
-  :param original_entries: 请求记录日志
+  :param original_entries: 原始请求记录日志
   :param root_request: 根请求 url 地址
   :return: 不重复的 URL 地址列表
   """
@@ -30,23 +32,26 @@ def get_filtered_entries(original_entries, root_request):
   for entry in original_entries:
     # 根据 request url 进行过滤
     request_url = entry['request']['url']
-    if request_url.find('http') > -1 or request_url.find('https') > -1:
-      # 只提取有用信息
-      filtered_entry = {
-        # 请求地址
-        'request_url': unquote(request_url),
-        # 在网络上实际传输的字节数
-        'response_transfer_size': entry['response']['_transferSize'],
-        # mime 类型，根据不同类型给予不同的调度策略
-        # todo: 是否需要改成 entry._resourceType
-        'mime_type': entry['response']['content']['mimeType'],
-        # TTFB 字段，减去 rtt 后即为服务区准备此相应所需要的时间
-        'ttfb': entry['timings']['wait'],
-        # 发起此请求需要满足的依赖项
-        'dependencies': get_request_dependencies(entry['_initiator'], root_request)
-      }
-      # 只记录 http/https 请求
-      filtered_entries.append(filtered_entry)
+    # 只提取部分字段
+    filtered_entry = {
+      # 请求地址
+      'request_url': request_url,
+      # 在网络上实际传输的字节数
+      'response_transfer_size': entry['response']['_transferSize'],
+      # mime 类型，根据不同类型给予不同的调度策略
+      # todo: 是否需要改成 entry._resourceType
+      'resource_type': entry['_resourceType'],
+      # TTFB 字段，减去 rtt 后即为服务区准备此相应所需要的时间
+      'ttfb': float(entry['timings']['wait']),
+      # 发起此请求需要满足的依赖项
+      'dependencies': get_request_dependencies(entry['_initiator'], root_request),
+      # 对端主机名
+      'hostname': urlparse(request_url)[1],
+      # 请求方式
+      'method': entry['request']['method']
+    }
+    # 只记录 http/https 请求
+    filtered_entries.append(filtered_entry)
   return filtered_entries
 
 
@@ -61,7 +66,7 @@ def get_request_mapping(filtered_entries):
   resource_id = 0
   for entry in filtered_entries:
     # 提取请求 url
-    request_url = unquote(entry['request_url'])
+    request_url = entry['request_url']
     if request_url not in request_mapping:
       # 把该请求 url 添加到映射中
       request_mapping[request_url] = resource_id
@@ -79,7 +84,7 @@ def get_dependencies_from_call_frames(call_frames):
   # 依赖项列表
   dependency_urls = []
   for frame in call_frames:
-    dependency_urls.append(unquote(frame['url']))
+    dependency_urls.append(frame['url'])
   # 去重后输出
   return list(set(dependency_urls))
 
@@ -99,26 +104,28 @@ def get_request_dependencies(raw_initiator, root_request):
   request_initiator_type = raw_initiator['type']
 
   if request_initiator_type == 'other':
-    return [unquote(root_request)]
+    return [root_request]
 
   # 由 js 脚本发起的请求
   if request_initiator_type == 'script':
     if len(raw_initiator['stack']['callFrames']) > 0:
       return get_dependencies_from_call_frames(raw_initiator['stack']['callFrames'])
     elif len(raw_initiator['stack']['parent']['callFrames']) > 0:
-      return get_dependencies_from_call_frames(raw_initiator['stack']['parent']['callFrames'])
+      return get_dependencies_from_call_frames(
+        raw_initiator['stack']['parent']['callFrames'])
 
 
 def replace_dependency_url_with_resource_id(filtered_entries, request_mapping):
   """
   用 resource id 来替换原有的依赖项 url
+
   :param filtered_entries:
   :param request_mapping:
   :return:
   """
   for i in range(len(filtered_entries)):
     for j in range(len(filtered_entries[i]['dependencies'])):
-      key = unquote(filtered_entries[i]['dependencies'][j])
+      key = filtered_entries[i]['dependencies'][j]
       resource_id = request_mapping[key]
       filtered_entries[i]['dependencies'][j] = resource_id
 
@@ -132,12 +139,12 @@ def extract_har_json_object(json_object):
   """
   result = {
     # 发出去的第一个请求
-    'root_request': unquote(json_object['log']['pages'][0]['title'])
+    'root_request': json_object['log']['pages'][0]['title']
   }
 
   # 原始记录
   original_entries = json_object['log']['entries']
-  # 过滤后只包含 http/https 的记录列表
+  # 过滤后只包含部分字段的记录列表
   filtered_entries = get_filtered_entries(original_entries, result['root_request'])
   result['filtered_entries'] = filtered_entries
 
@@ -155,22 +162,28 @@ def replay(extracted_har_object):
   request_mapping = extracted_har_object['request_mapping']
   # 已经完成了的请求列表，初始化为 request_mapping 的长度，值为 false
   request_status = [False] * len(request_mapping)
+  # 每一个 time_slot 回放的请求列表
+  replay_log = []
   # root_request 的初始状态为已满足
   request_status[0] = True
+  replay_log.append([extracted_har_object['root_request']])
 
-  # 每一轮回放的请求列表
-  replay_log = []
+  # 每个 time slot 发送一个数据包
+  time_slot = 1
+
   # 遍历所有 request 以寻找出当前可以回放的所有 replay
   while not is_replay_finished(request_status):
-    # 在本回合需要回放的 request
+    # 筛选出能够在本 time slot 中回放的请求
     request_to_replay = []
     for entry in extracted_har_object['filtered_entries']:
       request_url = entry['request_url']
-      if is_dependencies_met(entry['dependencies'], request_status):
+      if not request_status[request_mapping[request_url]] and \
+        is_dependencies_met(entry['dependencies'], request_status):
         request_to_replay.append(request_url)
-        request_status[request_mapping[request_url]] = True
-        print('fuck')
     replay_log.append(request_to_replay)
+    # 把本次回放的请求状态标记为已完成状态
+    for request_url in request_to_replay:
+      request_status[request_mapping[request_url]] = True
 
   return replay_log
 
@@ -203,6 +216,51 @@ def is_replay_finished(request_status):
   return result
 
 
+def get_request_by_url(filtered_requests, target_request):
+  """
+  根据 url 获取请求条目
+
+  :param filtered_requests: 筛选过的请求列表
+  :param target_request: 目标请求的 url
+  :return: 该请求条目
+  """
+  for entry in filtered_requests:
+    if entry['request_url'] == target_request:
+      return entry
+
+
+def ping(hostname, count=5):
+  p = Popen(['ping', hostname, '-c %s' % count], stdout=PIPE)
+  ping_result = str(p.communicate()[0])
+  # 从 ping 结果中提取系统提供的 rtt 统计数据
+  rtt_statistics_str = \
+    re.compile('[0-9]+.[0-9]+/[0-9]+.[0-9]+/[0-9]+.[0-9]+/[0-9]+.[0-9]+') \
+      .findall(str(ping_result))[0]
+  avg_rtt = rtt_statistics_str.split('/')[1]
+  return float(avg_rtt)
+
+
+def get_hostname_average_rtt(extracted_har_object):
+  """
+  获取所有主机的平均 rtt 数据
+  :param extracted_har_object: 数据集对象
+  """
+  ping_hostname_list = []
+  for request in extracted_har_object['filtered_entries']:
+    ping_hostname_list.append(request['hostname'])
+  # 去重后求各域名的平均 rtt
+  ping_hostname_list = list(set(ping_hostname_list))
+  ping_result = {}
+  # 创建一个等长的资源池
+  pool = Pool(len(ping_hostname_list))
+  ping_result_list = pool.map(ping, ping_hostname_list)
+  for i in range(len(ping_hostname_list)):
+    ping_result[ping_hostname_list[i]] = ping_result_list[i]
+  # 把收集到的 rtt 数据更新到数据集中
+  for entry in extracted_har_object['filtered_entries']:
+    entry['server_delay'] = entry['ttfb'] - ping_result[entry['hostname']]
+
+
 def main():
   # 读取 JSON 数据
   file_path = 'har-sample.json'
@@ -211,11 +269,33 @@ def main():
 
   # 从 HAR 文件中提取所需信息
   extracted_har_object = extract_har_json_object(json_object)
-
-  print('fuck')
-
   # 在获取了所有的依赖项之后，就可以按照依赖项顺序回放各请求了
-  replay(extracted_har_object)
+  filtered_requests = extracted_har_object['filtered_entries']
+
+  # 计算服务器生成响应的延迟
+  print('retrieving average rtt for all hostname')
+  get_hostname_average_rtt(extracted_har_object)
+
+  # 重放请求以获取各项指标
+  replay_log = replay(extracted_har_object)
+  print('time slot count: %s' % len(replay_log))
+  request_count = 1
+  for time_slot in range(len(replay_log)):
+    print('in time slot: <%3d>, %3d requested replayed' %
+          (time_slot + 1, len(replay_log[time_slot])))
+    for request in replay_log[time_slot]:
+      print('  <%3d>: %s' % (request_count, request))
+      request_entry = get_request_by_url(filtered_requests, request)
+      method = request_entry['method']
+      response_transfer_size = request_entry['response_transfer_size'] / 1e3
+      ttfb = request_entry['ttfb']
+      hostname = request_entry['hostname']
+      server_delay = request_entry['server_delay']
+      resource_type = request_entry['resource_type']
+      print('    method: <%s>, size: <%4.2f>KB, TTFB: <%3.3f>ms, hostname: <%s>, '
+            'server delay: <%3.3f>ms, resource type: <%s>' %
+            (method, response_transfer_size, ttfb, hostname, server_delay, resource_type))
+      request_count += 1
 
 
 if __name__ == '__main__':
