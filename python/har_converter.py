@@ -1,7 +1,9 @@
 # coding: utf-8
 
 import re
+from enum import Enum
 from multiprocessing import Pool
+from queue import Queue
 from subprocess import Popen, PIPE
 from urllib.parse import urlparse
 
@@ -19,6 +21,40 @@ har_converter 的作用是把 chrome devtools 导出的 har 格式 json 文件�
 """
 
 
+class SchedulerType(Enum):
+  ROUND_ROBIN_SCHEDULER = 1
+  WEIGHTED_ROUND_ROBIN_SCHEDULER = 2
+  DYNAMIC_FIRST_COME_FIRST_SERVE_SCHEDULER = 3
+  CLASSIFIED_WEIGHTED_ROUND_ROBIN_SCHEDULER = 4
+
+
+class StreamStatus(Enum):
+  """
+  stream 状态
+  """
+  UNAVAILABLE = 1  # 依赖项尚未满足，无法发送
+  ENQUEUED = 2  # 依赖项以满足，已被加入发送队列中
+  FINISHED = 3  # 已经发送完毕
+
+
+class PacketNumberGenerator:
+  __packet_number = 0
+
+  def get_packet_number(self):
+    return self.__packet_number
+
+  def move_to_next_packet_number(self):
+    self.__packet_number += 1
+
+
+# 当前使用的调度器类型
+ACTIVE_SCHEDULER = SchedulerType.ROUND_ROBIN_SCHEDULER
+# 一个 QUIC 包所能携带的数据字节数
+DATA_BLOCK_SIZE = 1.2 * 1e3
+# 负责管理全局共享的数据包编号
+packet_number_generator = PacketNumberGenerator()
+
+
 def get_filtered_entries(original_entries, root_request):
   """
   本方法把原始记录的每一项中提取有用数据，并返回只包含筛选后的字段的 entry 列表
@@ -29,29 +65,52 @@ def get_filtered_entries(original_entries, root_request):
   """
   # 从原始数据中过滤出来的 http/https 请求列表
   filtered_entries = []
+  # 请求 url 到 resource id 的映射
+  request_url_to_resource_id_map = {}
+  resource_id = 0
   for entry in original_entries:
     # 根据 request url 进行过滤
     request_url = entry['request']['url']
+    request_url_to_resource_id_map[request_url] = resource_id
     # 只提取部分字段
     filtered_entry = {
+      # 资源 id
+      'resource_id': resource_id,
       # 请求地址
       'request_url': request_url,
       # 在网络上实际传输的字节数
-      'response_transfer_size': entry['response']['_transferSize'],
+      'response_size': entry['response']['_transferSize'],
+      # 尚未被发送的字节数
+      'remaining_size': entry['response']['_transferSize'],
       # mime 类型，根据不同类型给予不同的调度策略
-      # todo: 是否需要改成 entry._resourceType
       'resource_type': entry['_resourceType'],
       # TTFB 字段，减去 rtt 后即为服务区准备此相应所需要的时间
       'ttfb': float(entry['timings']['wait']),
       # 发起此请求需要满足的依赖项
-      'dependencies': get_request_dependencies(entry['_initiator'], root_request),
+      'dependencies': get_request_dependencies(
+        entry['_initiator'], root_request, request_url_to_resource_id_map),
       # 对端主机名
       'hostname': urlparse(request_url)[1],
       # 请求方式
-      'method': entry['request']['method']
+      'method': entry['request']['method'],
+      # 入队时间
+      'enqueued_at': None,
+      # 开始传输时间
+      'started_at': None,
+      # 完成时间
+      'finished_at': None,
+      # 是否已经开始传输
+      'is_started': False,
+
+      # 以下是需要计算的字段
+
+      # 排队消耗的时间
+      'queued_for': None,
+      # 传输数据所消耗的时间
+      'transmission_time': None
     }
-    # 只记录 http/https 请求
     filtered_entries.append(filtered_entry)
+    resource_id += 1
   return filtered_entries
 
 
@@ -89,30 +148,37 @@ def get_dependencies_from_call_frames(call_frames):
   return list(set(dependency_urls))
 
 
-def get_request_dependencies(raw_initiator, root_request):
+def get_request_dependencies(raw_initiator, root_request, request_url_to_resource_id_map):
   """
   获取 request 的依赖项。即这些依赖项都被满足之后才能发起本次请求。
 
   :param raw_initiator: 日志中的 _initiator 对象
   :param root_request: 根请求 url
+  :param request_url_to_resource_id_map: 请求 url 到 resource id 之间的映射
   :return: 此 request 的依赖项列表
   """
   if 'url' in raw_initiator:
-    return [raw_initiator['url']]
+    return [request_url_to_resource_id_map[raw_initiator['url']]]
 
   # 请求类型
   request_initiator_type = raw_initiator['type']
 
   if request_initiator_type == 'other':
-    return [root_request]
+    return [request_url_to_resource_id_map[root_request]]
 
   # 由 js 脚本发起的请求
+  dependencies_url = None
   if request_initiator_type == 'script':
     if len(raw_initiator['stack']['callFrames']) > 0:
-      return get_dependencies_from_call_frames(raw_initiator['stack']['callFrames'])
+      dependencies_url = get_dependencies_from_call_frames(raw_initiator['stack']['callFrames'])
     elif len(raw_initiator['stack']['parent']['callFrames']) > 0:
-      return get_dependencies_from_call_frames(
-        raw_initiator['stack']['parent']['callFrames'])
+      dependencies_url = get_dependencies_from_call_frames(raw_initiator['stack']['parent']['callFrames'])
+
+  # 把 url 形式的依赖性转换为 resource id 形式的依赖项
+  resource_id_dependencies = []
+  for url in dependencies_url:
+    resource_id_dependencies.append(request_url_to_resource_id_map[url])
+  return resource_id_dependencies
 
 
 def replace_dependency_url_with_resource_id(filtered_entries, request_mapping):
@@ -148,44 +214,168 @@ def extract_har_json_object(json_object):
   filtered_entries = get_filtered_entries(original_entries, result['root_request'])
   result['filtered_entries'] = filtered_entries
 
-  # 请求 url 与资源 id 之间的映射字典
-  result['request_mapping'] = get_request_mapping(filtered_entries)
-
-  # 用 resource id 来替换依赖项 url
-  replace_dependency_url_with_resource_id(filtered_entries, result['request_mapping'])
-
   return result
 
 
+def round_robin_scheduler(active_stream_queue):
+  """
+  实现最简单的轮询调度器，在各浏览器中作为后备选项。IE/Edge 使用此调度器
+
+  :param active_stream_queue 活跃 stream 队列
+  :return: 当前应该发送哪些 stream，以及它们在数据包中的字节数比例
+  """
+  recipe = []
+
+  # 已经添加的字节数
+  bytes_added = 0
+  while bytes_added < DATA_BLOCK_SIZE and not active_stream_queue.empty():
+    # 可供此 stream 使用的字节数
+    max_data_len = DATA_BLOCK_SIZE - bytes_added
+    stream = active_stream_queue.get()
+    remaining_data_len = stream['remaining_size']
+    if remaining_data_len > max_data_len:
+      # 尚未完全发送所有数据，放回队尾等待下一次调度
+      bytes_added += max_data_len
+      recipe.append({
+        'resource_id': stream['resource_id'],
+        'length': max_data_len,
+        'is_finished': False
+      })
+      stream['remaining_size'] -= max_data_len
+      active_stream_queue.put(stream)
+    else:
+      # 已经发完全部数据，下一轮将添加后续 stream 的数据
+      bytes_added += remaining_data_len
+      recipe.append({
+        'resource_id': stream['resource_id'],
+        'length': remaining_data_len,
+        'is_finished': True
+      })
+      stream['remaining_size'] -= remaining_data_len
+    # 标注开始时间
+    if not stream['is_started']:
+      stream['is_started'] = True
+      stream['started_at'] = packet_number_generator.get_packet_number()
+
+  return recipe
+
+
+def weighted_round_robin_scheduler(active_stream_queue):
+  """
+  实现加权轮询调度调度器，Safari 使用此调度器
+
+  :return:
+  """
+  recipe = []
+  return recipe
+
+
+def dynamic_first_come_first_serve_scheduler(active_stream_queue):
+  """
+  实现动态先进先出调度器，Chrome 使用此调度器
+
+  :return:
+  """
+  recipe = []
+  return recipe
+
+
+def classified_weighted_round_robin_scheduler(active_stream_queue):
+  """
+  实现分类加权调度轮询调度器，Firefox 使用此调度器
+
+  :return:
+  """
+  recipe = []
+  return recipe
+
+
+def get_packet(recipe):
+  return recipe
+
+
+def compose_next_packet(active_stream_queue, request_status):
+  """
+  组装下一个数据包
+
+  :param active_stream_queue: 活跃 stream 队列
+  :param request_status: stream 的状态
+  :return: 下一个数据包
+  """
+  # 根据不同的调度器来决定数据包可以携带哪些 stream 的数据
+  if ACTIVE_SCHEDULER == SchedulerType.ROUND_ROBIN_SCHEDULER:
+    # IE/Edge
+    recipe = round_robin_scheduler(active_stream_queue)
+  elif ACTIVE_SCHEDULER == SchedulerType.WEIGHTED_ROUND_ROBIN_SCHEDULER:
+    # Safari
+    recipe = weighted_round_robin_scheduler(active_stream_queue)
+  elif ACTIVE_SCHEDULER == SchedulerType.DYNAMIC_FIRST_COME_FIRST_SERVE_SCHEDULER:
+    # Chrome
+    recipe = dynamic_first_come_first_serve_scheduler(active_stream_queue)
+  else:
+    # FireFox
+    recipe = classified_weighted_round_robin_scheduler(active_stream_queue)
+
+  # 按照要求组装数据包
+  packet = get_packet(recipe)
+  return packet
+
+
 def replay(extracted_har_object):
-  # 请求 url 到 resource id 的映射
-  request_mapping = extracted_har_object['request_mapping']
-  # 已经完成了的请求列表，初始化为 request_mapping 的长度，值为 false
-  request_status = [False] * len(request_mapping)
-  # 每一个 time_slot 回放的请求列表
+  # 一些到数据对象的指针
+  filtered_entries = extracted_har_object['filtered_entries']
+
+  # 已经完成了的请求列表，初始化为 request_mapping 的长度，初始值为依赖项未满足状态
+  request_status = [StreamStatus.UNAVAILABLE] * len(filtered_entries)
+  # 所有依赖项就绪，可以发送数据的 stream 队列
+  active_stream_queue = Queue()
+  # 记录每一个 packet 中携带的请求请求列表
   replay_log = []
+
+  # 把 root_request 放入活跃队列中，以便调度器能够调度此请求
+  root_request = get_request_by_url(filtered_entries, extracted_har_object['root_request'])
   # root_request 的初始状态为已满足
-  request_status[0] = True
-  replay_log.append([extracted_har_object['root_request']])
+  request_status[root_request['resource_id']] = StreamStatus.ENQUEUED
+  # active_stream_queue.put(get_active_stream_block(root_request))
+  active_stream_queue.put(root_request)
+  root_request['enqueued_at'] = packet_number_generator.get_packet_number()
 
-  # 每个 time slot 发送一个数据包
-  time_slot = 1
-
-  # 遍历所有 request 以寻找出当前可以回放的所有 replay
+  # 遍历所有 request 列表以寻找出当前可以回放的所有 request
   while not is_replay_finished(request_status):
-    # 筛选出能够在本 time slot 中回放的请求
-    request_to_replay = []
+    # 筛选出能够发起的请求
     for entry in extracted_har_object['filtered_entries']:
-      request_url = entry['request_url']
-      if not request_status[request_mapping[request_url]] and \
+      resource_id = entry['resource_id']
+      # 只有处于未就绪状态的 stream 才需要检查依赖项状况，如果依赖项全部被满足，则加入到发送队列中
+      if request_status[resource_id] == StreamStatus.UNAVAILABLE and \
         is_dependencies_met(entry['dependencies'], request_status):
-        request_to_replay.append(request_url)
-    replay_log.append(request_to_replay)
-    # 把本次回放的请求状态标记为已完成状态
-    for request_url in request_to_replay:
-      request_status[request_mapping[request_url]] = True
+        # 把可以发送的对象入队
+        # active_stream_queue.put(get_active_stream_block(entry))
+        active_stream_queue.put(entry)
+        # 修改状态位
+        request_status[entry['resource_id']] = StreamStatus.ENQUEUED
+        # 记录入队时间
+        entry['enqueued_at'] = packet_number_generator.get_packet_number()
+
+    # 从活跃 stream 队列中选取合适的 stream 来组装下一个数据包
+    next_packet = compose_next_packet(active_stream_queue, request_status)
+    # 标注已完成的 stream
+    for frame in next_packet:
+      if frame['is_finished']:
+        request_status[frame['resource_id']] = StreamStatus.FINISHED
+        entry = get_request_by_id(frame['resource_id'], filtered_entries)
+        # 标注完成时间
+        entry['finished_at'] = packet_number_generator.get_packet_number()
+    # 记录此数据包
+    replay_log.append(next_packet)
+    packet_number_generator.move_to_next_packet_number()
 
   return replay_log
+
+
+def get_request_by_id(resource_id, filtered_entries):
+  for entry in filtered_entries:
+    if entry['resource_id'] == resource_id:
+      return entry
 
 
 def is_dependencies_met(dependencies, request_status):
@@ -197,7 +387,7 @@ def is_dependencies_met(dependencies, request_status):
   :return: 是否所有依赖项都已经被满足
   """
   for d in dependencies:
-    if not request_status[d]:
+    if request_status[d] != StreamStatus.FINISHED:
       return False
   return True
 
@@ -206,14 +396,14 @@ def is_replay_finished(request_status):
   """
   是否已经回放了所有请求
 
-  :param request_status: 请求的状态，True 指已被回放，False 指未被回放
+  :param request_status: 请求的状态
   :return: 是否已经回放了所有请求
   """
   # 默认为已完成状态，如果在遍历过程中遇到尚未回放的请求，则会变成未完成状态
-  result = True
   for status in request_status:
-    result &= status
-  return result
+    if not status == StreamStatus.FINISHED:
+      return False
+  return True
 
 
 def get_request_by_url(filtered_requests, target_request):
@@ -261,6 +451,78 @@ def get_hostname_average_rtt(extracted_har_object):
     entry['server_delay'] = entry['ttfb'] - ping_result[entry['hostname']]
 
 
+def compute_queue_and_transmission_time(filtered_entries):
+  """
+  为数据集中的每一个条目计算排队时间和传输时间
+
+  :param filtered_entries: 数据集
+  """
+  for entry in filtered_entries:
+    entry['queued_for'] = entry['started_at'] - entry['enqueued_at']
+    entry['transmission_time'] = entry['finished_at'] - entry['started_at'] + 1
+
+
+def add_new_statistic_sample(resource_type, entry, timing_statistics):
+  timing_statistics[resource_type]['request_count'] += 1
+  timing_statistics[resource_type]['enqueued_at'] += entry['enqueued_at']
+  timing_statistics[resource_type]['queued_for'] += entry['queued_for']
+  timing_statistics[resource_type]['started_at'] += entry['started_at']
+  timing_statistics[resource_type]['finished_at'] += entry['finished_at']
+  timing_statistics[resource_type]['transmission_time'] += entry['transmission_time']
+
+  if entry['started_at'] < timing_statistics[resource_type]['min_start_time']:
+    timing_statistics[resource_type]['min_start_time'] = entry['started_at']
+  if entry['finished_at'] > timing_statistics[resource_type]['max_finish_time']:
+    timing_statistics[resource_type]['max_finish_time'] = entry['finished_at']
+
+
+def compute_classified_timing_statistics(filtered_entries):
+  """
+  按照不同的资源类型来计算统计数据
+
+  :param filtered_entries: 数据集
+  :return: 统计数据集合
+  """
+  result_template = {
+    'request_count': 0,
+    'enqueued_at': 0,
+    'queued_for': 0,
+    'started_at': 0,
+    'finished_at': 0,
+    'transmission_time': 0,
+    # 同类请求的最早开始时间
+    'min_start_time': float('inf'),
+    # 同类请求的最晚结束时间
+    'max_finish_time': 0
+  }
+
+  timing_statistics = {
+    # document, script, stylesheet
+    'critical_path': result_template.copy(),
+    'image': result_template.copy(),
+    'xhr': result_template.copy(),
+    'other': result_template.copy()
+  }
+
+  # 收集所有样本
+  for entry in filtered_entries:
+    resource_type = entry['resource_type']
+    if resource_type == 'document' or resource_type == 'stylesheet' or resource_type == 'script':
+      add_new_statistic_sample('critical_path', entry, timing_statistics)
+    else:
+      add_new_statistic_sample(resource_type, entry, timing_statistics)
+  # 计算所有样本的平均数据
+  for value in timing_statistics.values():
+    request_count = value['request_count']
+    value['enqueued_at'] /= request_count
+    value['queued_for'] /= request_count
+    value['started_at'] /= request_count
+    value['finished_at'] /= request_count
+    value['transmission_time'] /= request_count
+
+  return timing_statistics
+
+
 def main():
   # 读取 JSON 数据
   file_path = 'har-sample.json'
@@ -270,7 +532,6 @@ def main():
   # 从 HAR 文件中提取所需信息
   extracted_har_object = extract_har_json_object(json_object)
   # 在获取了所有的依赖项之后，就可以按照依赖项顺序回放各请求了
-  filtered_requests = extracted_har_object['filtered_entries']
 
   # 计算服务器生成响应的延迟
   print('retrieving average rtt for all hostname')
@@ -278,24 +539,35 @@ def main():
 
   # 重放请求以获取各项指标
   replay_log = replay(extracted_har_object)
-  print('time slot count: %s' % len(replay_log))
-  request_count = 1
-  for time_slot in range(len(replay_log)):
-    print('in time slot: <%3d>, %3d requested replayed' %
-          (time_slot + 1, len(replay_log[time_slot])))
-    for request in replay_log[time_slot]:
-      print('  <%3d>: %s' % (request_count, request))
-      request_entry = get_request_by_url(filtered_requests, request)
-      method = request_entry['method']
-      response_transfer_size = request_entry['response_transfer_size'] / 1e3
-      ttfb = request_entry['ttfb']
-      hostname = request_entry['hostname']
-      server_delay = request_entry['server_delay']
-      resource_type = request_entry['resource_type']
-      print('    method: <%s>, size: <%4.2f>KB, TTFB: <%3.3f>ms, hostname: <%s>, '
-            'server delay: <%3.3f>ms, resource type: <%s>' %
-            (method, response_transfer_size, ttfb, hostname, server_delay, resource_type))
-      request_count += 1
+  with open('result.log', 'a') as output_file:
+    filtered_entries = extracted_har_object['filtered_entries']
+    compute_queue_and_transmission_time(filtered_entries)
+    timing_statistics = compute_classified_timing_statistics(filtered_entries)
+
+    # 输出分类统计信息
+    for key, value in timing_statistics.items():
+      print('timing statistics for resource type=<%s>' % key, file=output_file)
+      print('  request count=<%3d>' % value['request_count'], file=output_file)
+      print('  enqueued at=<%3.2f>' % value['enqueued_at'], file=output_file)
+      print('  queued_for=<%3.2f>' % value['queued_for'], file=output_file)
+      print('  started_at=<%3.2f>' % value['started_at'], file=output_file)
+      print('  finished_at=<%3.2f>' % value['finished_at'], file=output_file)
+      print('  transmission_time=<%3.2f>' % value['transmission_time'], file=output_file)
+      print('  min_start_time=<%3.2f>' % value['min_start_time'], file=output_file)
+      print('  max_finish_time=<%3.2f>' % value['max_finish_time'], file=output_file)
+
+    print('', file=output_file)
+
+    for i in range(len(filtered_entries)):
+      entry = filtered_entries[i]
+      print('request <%3d>:<%3.2f>KB, type=<%s>, url = <%s>' % (i, entry['response_size'] / 1e3, entry['resource_type'], entry['request_url']), file=output_file)
+      print('  enqueued_at=<%4d>, queued_for=<%2d>, started_at=<%4d>, finished_at=<%4d>, transmission_time=<%4d>' %
+            (entry['enqueued_at'], entry['queued_for'], entry['started_at'], entry['finished_at'], entry['transmission_time']), file=output_file)
+
+    print('', file=output_file)
+
+    for r in replay_log:
+      print(r, file=output_file)
 
 
 if __name__ == '__main__':
