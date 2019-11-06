@@ -267,6 +267,93 @@ def weighted_round_robin_scheduler(active_stream_queue):
   :return:
   """
   recipe = []
+  return recipe
+
+
+def sort_by_start_time(tmp_list):
+  return sorted(tmp_list, key=lambda stream: stream['enqueued_at'])
+
+
+def get_queue_copied_as_list(target_queue):
+  result = []
+  while not target_queue.empty():
+    result.append(target_queue.get())
+  return result
+
+
+def replace_with_dynamic_queue(active_stream_queue):
+  """
+  构建 Dynamic FCFS 调度算所需要的动态先进先出队列
+
+  :param active_stream_queue 当前活跃 stream 队列
+  :return:
+  """
+  # 只在复制的队列上操作以避免影响原队列
+  queue_copy = get_queue_copied_as_list(active_stream_queue)
+
+  # HTML, CSS, fonts
+  highest_priority_list = []
+  # JS declared prior to first image, XHR
+  high_priority_list = []
+  # JS declared after first image
+  normal_priority_list = []
+  # images, async and defer JS
+  low_priority_list = []
+  # pushed assets (initially)
+  lowest_priority_list = []
+
+  # 首张图片的 resource_id
+  first_image = -1
+  for stream in queue_copy:
+    resource_type = stream['resource_type']
+    if resource_type == 'document' or resource_type == 'stylesheet' \
+      or resource_type == 'font':
+      # HTML, CSS, fonts
+      highest_priority_list.append(stream)
+      continue
+    if resource_type == 'script':
+      if first_image == -1:
+        # 首张图片之前的 JS
+        high_priority_list.append(stream)
+        first_image = stream['resource_id']
+        continue
+      else:
+        # 首张图片之后的 JS
+        normal_priority_list.append(stream)
+        continue
+    if resource_type == 'xhr':
+      high_priority_list.append(stream)
+      continue
+    if resource_type == 'image':
+      low_priority_list.append(stream)
+      continue
+    else:
+      lowest_priority_list.append(stream)
+
+  highest_priority_list = sort_by_start_time(highest_priority_list)
+  high_priority_list = sort_by_start_time(high_priority_list)
+  normal_priority_list = sort_by_start_time(normal_priority_list)
+  low_priority_list = sort_by_start_time(low_priority_list)
+  lowest_priority_list = sort_by_start_time(lowest_priority_list)
+
+  highest_priority_list.extend(high_priority_list)
+  highest_priority_list.extend(normal_priority_list)
+  highest_priority_list.extend(low_priority_list)
+  highest_priority_list.extend(lowest_priority_list)
+
+  for stream in highest_priority_list:
+    active_stream_queue.put(stream)
+
+
+def dynamic_first_come_first_serve_scheduler(active_stream_queue):
+  """
+  实现动态先进先出调度器，Chrome 使用此调度器
+
+  :return:
+  """
+  replace_with_dynamic_queue(active_stream_queue)
+
+  recipe = []
 
   # 已经添加的字节数
   bytes_added = 0
@@ -297,18 +384,9 @@ def weighted_round_robin_scheduler(active_stream_queue):
     # 标注开始时间
     if not stream['is_started']:
       stream['is_started'] = True
+      # stream 开始传输的时间点，用于 FCFS 调度和计算传输时间等指标
       stream['started_at'] = packet_number_generator.get_packet_number()
 
-  return recipe
-
-
-def dynamic_first_come_first_serve_scheduler(active_stream_queue):
-  """
-  实现动态先进先出调度器，Chrome 使用此调度器
-
-  :return:
-  """
-  recipe = []
   return recipe
 
 
@@ -555,6 +633,19 @@ def compute_classified_timing_statistics(filtered_entries):
   return timing_statistics
 
 
+def get_scheduler_name_by_enum_value(enum_value):
+  name = None
+  if enum_value == SchedulerType.NAIVE_ROUND_ROBIN_SCHEDULER:
+    name = 'naive_round_robin_scheduler'
+  elif enum_value == SchedulerType.DYNAMIC_FIRST_COME_FIRST_SERVE_SCHEDULER:
+    name = 'dynamic_first_come_first_serve_scheduler'
+  elif enum_value == SchedulerType.CLASSIFIED_WEIGHTED_ROUND_ROBIN_SCHEDULER:
+    name = 'classified_weighted_round_robin_scheduler'
+  elif enum_value == SchedulerType.WEIGHTED_ROUND_ROBIN_SCHEDULER:
+    name = 'weighted_round_robin_scheduler'
+  return name
+
+
 def main():
   # 读取 JSON 数据
   file_path = 'har-sample.json'
@@ -566,12 +657,12 @@ def main():
   # 在获取了所有的依赖项之后，就可以按照依赖项顺序回放各请求了
 
   # 计算服务器生成响应的延迟
-  print('retrieving average rtt for all hostname')
-  get_hostname_average_rtt(extracted_har_object)
+  # print('retrieving average rtt for all hostname')
+  # get_hostname_average_rtt(extracted_har_object)
 
   # 重放请求以获取各项指标
   replay_log = replay(extracted_har_object)
-  with open('result.log', 'a') as output_file:
+  with open('%s.log' % get_scheduler_name_by_enum_value(ACTIVE_SCHEDULER), 'a') as output_file:
     filtered_entries = extracted_har_object['filtered_entries']
     compute_queue_and_transmission_time(filtered_entries)
     timing_statistics = compute_classified_timing_statistics(filtered_entries)
@@ -592,9 +683,11 @@ def main():
 
     for i in range(len(filtered_entries)):
       entry = filtered_entries[i]
-      print('request <%3d>:<%3.2f>KB, type=<%s>, url = <%s>' % (i, entry['response_size'] / 1e3, entry['resource_type'], entry['request_url']), file=output_file)
+      print('request <%3d>:<%3.2f>KB, type=<%s>, url = <%s>' % (
+        i, entry['response_size'] / 1e3, entry['resource_type'], entry['request_url']), file=output_file)
       print('  enqueued_at=<%4d>, queued_for=<%2d>, started_at=<%4d>, finished_at=<%4d>, transmission_time=<%4d>' %
-            (entry['enqueued_at'], entry['queued_for'], entry['started_at'], entry['finished_at'], entry['transmission_time']), file=output_file)
+            (entry['enqueued_at'], entry['queued_for'], entry['started_at'], entry['finished_at'],
+             entry['transmission_time']), file=output_file)
 
     print('', file=output_file)
 
