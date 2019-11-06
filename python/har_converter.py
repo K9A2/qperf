@@ -22,7 +22,7 @@ har_converter 的作用是把 chrome devtools 导出的 har 格式 json 文件�
 
 
 class SchedulerType(Enum):
-  ROUND_ROBIN_SCHEDULER = 1
+  NAIVE_ROUND_ROBIN_SCHEDULER = 1
   WEIGHTED_ROUND_ROBIN_SCHEDULER = 2
   DYNAMIC_FIRST_COME_FIRST_SERVE_SCHEDULER = 3
   CLASSIFIED_WEIGHTED_ROUND_ROBIN_SCHEDULER = 4
@@ -48,7 +48,7 @@ class PacketNumberGenerator:
 
 
 # 当前使用的调度器类型
-ACTIVE_SCHEDULER = SchedulerType.ROUND_ROBIN_SCHEDULER
+ACTIVE_SCHEDULER = SchedulerType.NAIVE_ROUND_ROBIN_SCHEDULER
 # 一个 QUIC 包所能携带的数据字节数
 DATA_BLOCK_SIZE = 1.2 * 1e3
 # 负责管理全局共享的数据包编号
@@ -217,7 +217,7 @@ def extract_har_json_object(json_object):
   return result
 
 
-def round_robin_scheduler(active_stream_queue):
+def naive_round_robin_scheduler(active_stream_queue):
   """
   实现最简单的轮询调度器，在各浏览器中作为后备选项。IE/Edge 使用此调度器
 
@@ -267,6 +267,38 @@ def weighted_round_robin_scheduler(active_stream_queue):
   :return:
   """
   recipe = []
+
+  # 已经添加的字节数
+  bytes_added = 0
+  while bytes_added < DATA_BLOCK_SIZE and not active_stream_queue.empty():
+    # 可供此 stream 使用的字节数
+    max_data_len = DATA_BLOCK_SIZE - bytes_added
+    stream = active_stream_queue.get()
+    remaining_data_len = stream['remaining_size']
+    if remaining_data_len > max_data_len:
+      # 尚未完全发送所有数据，放回队尾等待下一次调度
+      bytes_added += max_data_len
+      recipe.append({
+        'resource_id': stream['resource_id'],
+        'length': max_data_len,
+        'is_finished': False
+      })
+      stream['remaining_size'] -= max_data_len
+      active_stream_queue.put(stream)
+    else:
+      # 已经发完全部数据，下一轮将添加后续 stream 的数据
+      bytes_added += remaining_data_len
+      recipe.append({
+        'resource_id': stream['resource_id'],
+        'length': remaining_data_len,
+        'is_finished': True
+      })
+      stream['remaining_size'] -= remaining_data_len
+    # 标注开始时间
+    if not stream['is_started']:
+      stream['is_started'] = True
+      stream['started_at'] = packet_number_generator.get_packet_number()
+
   return recipe
 
 
@@ -303,9 +335,9 @@ def compose_next_packet(active_stream_queue, request_status):
   :return: 下一个数据包
   """
   # 根据不同的调度器来决定数据包可以携带哪些 stream 的数据
-  if ACTIVE_SCHEDULER == SchedulerType.ROUND_ROBIN_SCHEDULER:
+  if ACTIVE_SCHEDULER == SchedulerType.NAIVE_ROUND_ROBIN_SCHEDULER:
     # IE/Edge
-    recipe = round_robin_scheduler(active_stream_queue)
+    recipe = naive_round_robin_scheduler(active_stream_queue)
   elif ACTIVE_SCHEDULER == SchedulerType.WEIGHTED_ROUND_ROBIN_SCHEDULER:
     # Safari
     recipe = weighted_round_robin_scheduler(active_stream_queue)
