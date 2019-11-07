@@ -1,13 +1,15 @@
 # coding: utf-8
 
 import re
+import sys
 from enum import Enum
+from getopt import getopt, GetoptError
 from multiprocessing import Pool
 from queue import Queue
 from subprocess import Popen, PIPE
 from urllib.parse import urlparse
 
-from python.json_util import read_json_file
+from json_util import read_json_file, output_to_file
 
 """
 har_converter 的作用是把 chrome devtools 导出的 har 格式 json 文件转换为项目所需的数据
@@ -556,7 +558,7 @@ def get_hostname_average_rtt(extracted_har_object):
   ping_result_list = pool.map(ping, ping_hostname_list)
   for i in range(len(ping_hostname_list)):
     ping_result[ping_hostname_list[i]] = ping_result_list[i]
-  # 把收集到的 rtt 数据更新到数据集中
+  # 把收集到的 rtt 数据更新到数据集中，并计算 server_delay
   for entry in extracted_har_object['filtered_entries']:
     entry['server_delay'] = entry['ttfb'] - ping_result[entry['hostname']]
 
@@ -646,7 +648,7 @@ def get_scheduler_name_by_enum_value(enum_value):
   return name
 
 
-def main():
+def replay_requests():
   # 读取 JSON 数据
   file_path = 'har-sample.json'
   json_object = read_json_file(file_path)
@@ -695,5 +697,60 @@ def main():
       print(r, file=output_file)
 
 
+def usage():
+  print('har-converter can convert har object provided in json file, and output'
+        'replay sequence, server delay, and their server dealy in json config'
+        'file for qperf.')
+  print()
+  print('usage: python har_converter.py -i bilibili-config.json -o bilibili-config.json')
+
+
+def parse_command_line_arguments(argv):
+  opts = None
+
+  try:
+    opts, _ = getopt(argv, 'hi:o:', ['input=', 'output='])
+  except GetoptError:
+    usage()
+
+  args = {}
+
+  for opt, arg in opts:
+    if opt == '-h':
+      usage()
+      sys.exit()
+    elif opt in ('-i', '--input'):
+      args['har_file_path'] = arg
+    elif opt in ('-o', '--output'):
+      args['output_file_path'] = arg
+
+  return args
+
+
+def main(argv):
+  # 解析命令行参数
+  args = parse_command_line_arguments(argv)
+  har_file_path = args['har_file_path']
+  output_file_path = args['output_file_path']
+
+  print('har_file_path: <%s>' % har_file_path)
+  print('output_file_path: <%s>' % output_file_path)
+
+  json_object = read_json_file(har_file_path)
+  print('json file loaded, file path = <%s>' % har_file_path)
+
+  # 从 HAR 文件中提取所需信息
+  extracted_har_object = extract_har_json_object(json_object)
+  # 在获取了所有的依赖项之后，就可以按照依赖项顺序回放各请求了
+
+  # 计算服务器生成响应的延迟
+  print('retrieving average rtt for all hostname')
+  get_hostname_average_rtt(extracted_har_object)
+
+  # 保存数据到输出文件中
+  print('dumping result to config file: <%s>' % output_file_path)
+  output_to_file(output_file_path, extracted_har_object)
+
+
 if __name__ == '__main__':
-  main()
+  main(sys.argv[1:])
