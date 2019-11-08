@@ -207,13 +207,13 @@ def extract_har_json_object(json_object):
   """
   result = {
     # 发出去的第一个请求
-    'root_request': json_object['log']['pages'][0]['title']
+    'root_request_url': json_object['log']['pages'][0]['title']
   }
 
   # 原始记录
   original_entries = json_object['log']['entries']
   # 过滤后只包含部分字段的记录列表
-  filtered_entries = get_filtered_entries(original_entries, result['root_request'])
+  filtered_entries = get_filtered_entries(original_entries, result['root_request_url'])
   result['filtered_entries'] = filtered_entries
 
   return result
@@ -445,7 +445,7 @@ def replay(extracted_har_object):
   replay_log = []
 
   # 把 root_request 放入活跃队列中，以便调度器能够调度此请求
-  root_request = get_request_by_url(filtered_entries, extracted_har_object['root_request'])
+  root_request = get_request_by_url(filtered_entries, extracted_har_object['root_request_url'])
   # root_request 的初始状态为已满足
   request_status[root_request['resource_id']] = StreamStatus.ENQUEUED
   # active_stream_queue.put(get_active_stream_block(root_request))
