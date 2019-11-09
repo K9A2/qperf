@@ -10,13 +10,18 @@ QPerf 是一个通过模拟发送 Web 请求的方式来测试 HTTP/3 传输层�
 
 ## 使用方式
 
-client 和 server 双方可以使用同一个配置文件。配置文件中记载了以下两部分内容：
+client 和 server 双方都需要加载两个配置文件，可以使用同一个份 qconfig 或者 wconfig 配置文件
+
+- 使用 '-q' 或者 '--qconfig' 来加载 qperf 的配置项
+- 使用 '-w' 或者 '--wconfig' 来加载从 HAR 文件中提取的回放顺序，依赖项和 server_delay 信息
+
+配置文件中记载了以下两部分内容：
 
 - 从 HAR 中提取的关键部分，以便 QPerf 能够按照真实访问顺序回放请求
 - QPerf 的关键参数，以便调整 QPerf 和自带的 quic-go 的某些关键参数
 
-client 一侧的使用方式：./main -c -C config.json  
-server 一侧的使用方式：./main -s -C config.json
+client 一侧的使用方式：./main -c -q qconfig.json -w wconfig.json
+server 一侧的使用方式：./main -s -q qconfig.json -w wconfig.json
 
 ## QPerf 的工作流程
 
