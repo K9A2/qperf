@@ -2,9 +2,8 @@ package quic
 
 import "C"
 import (
+	"github.com/stormlin/qperf/common"
 	"sync"
-
-	. "github.com/stormlin/qperf/parameters"
 
 	"github.com/stormlin/qperf/quic-go/core/ackhandler"
 	"github.com/stormlin/qperf/quic-go/core/protocol"
@@ -90,7 +89,7 @@ func (f *framerI) AppendStreamFrames(frames []ackhandler.Frame, maxLen protocol.
 	var lastFrame *ackhandler.Frame
 
 	// 获取全局共享的配置文件
-	config := GetConfig()
+	config := common.GetProgramConfig()
 
 	f.mutex.Lock()
 	// pop STREAM frames, until less than MinStreamFrameSize bytes are left in the packet

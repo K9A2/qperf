@@ -2,7 +2,6 @@
 .vscode/
 build/
 venv/
-result/
 json/
 diff-stream-fixed-data-size/
 python/__pycache__/

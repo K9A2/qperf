@@ -2,136 +2,85 @@ package main
 
 import (
   "context"
-  "crypto/rand"
-  "crypto/rsa"
   "crypto/tls"
-  "crypto/x509"
-  "encoding/pem"
-  "fmt"
-  . "github.com/stormlin/qperf/result"
+  "github.com/google/logger"
+  . "github.com/stormlin/qperf/common"
+  . "github.com/stormlin/qperf/constants"
+  . "github.com/stormlin/qperf/datastructures"
+  "github.com/stormlin/qperf/quic-go"
   "io"
-  "math/big"
+  "net/url"
   "os"
-  "sort"
   "sync"
   "time"
-
-  "github.com/jessevdk/go-flags"
-  . "github.com/stormlin/qperf/parameters"
-  "github.com/stormlin/qperf/quic-go"
 )
 
-// 参数列表
-var opts struct {
-  // 运行于客户端模式
-  Client bool `short:"c" long:"client" description:"run as client"`
-  // 运行于服务器模式
-  Server bool `short:"s" long:"server" description:"run as server"`
-  // 配置文件路径
-  Config string `short:"C" long:"config" description:"load configuration file"`
-}
-
-// 打印使用信息
-func printUsage() {
-  fmt.Println("fuck usage")
-}
-
 func main() {
-  // 读取程序参数
-  args := os.Args
-  args, err := flags.ParseArgs(&opts, args)
+  logger.Init("main", false, true, os.Stdout)
+
+  // 加载程序参数
+  options, err := ParseOptions()
   if err != nil {
-    fmt.Println("parse arguments error")
-    printUsage()
-    os.Exit(1)
+    logger.Errorf("Error in parsing program arguments, error: \"%s\"",
+      err.Error())
+    PrintUsage()
+    os.Exit(-1)
+  }
+  config := BuildProgramConfig(options)
+  logger.Infof("param <IterationCount> = %d\n", config.IterationCount)
+  logger.Infof("param <ServerAddr> = %s\n", config.Address)
+  logger.Infof("param <ServerPort> = %s\n", config.Port)
+  logger.Infof("param <StreamMultiplexLimit> = %d\n", config.StreamMultiplexLimit)
+  logger.Infof("param <GroupNumber> = %d\n", config.GroupNumber)
+  escapedUrl, _ := url.QueryUnescape(config.RootRequestUrl)
+  logger.Infof("param <RootRequestUrl> = %s\n", escapedUrl)
+  logger.Infof("Number of requests = <%d>\n", len(config.ControlBlockSlice.BlockSlice))
+
+  // 在冗长模式下输出配置文件中包含的连接信息
+  if options.Verbose {
+    for index, block := range config.ControlBlockSlice.BlockSlice {
+      escapedUrl, _ = url.QueryUnescape(block.RequestUrl)
+      logger.Infof("request <%d>, url = <?%s>\n", index+1, block.RequestUrl)
+      logger.Infof("  resource_id = <%d>, response_size = <%3.2f>KB, "+
+        "resource_type = <%s>, dependencies = <%v>",
+        block.ResponseBody[0],
+        float32(block.ResponseSize)/1000.0,
+        block.ResourceType,
+        block.Dependencies,
+      )
+    }
   }
 
-  // 加载配置文件
-  LoadConfigurationFile(opts.Config)
-  config := GetConfig()
-
-  if opts.Client && !opts.Server {
-    var clientWaitGroup sync.WaitGroup
-    var evaluationResult EvaluationResult
-    for i := 0; i < config.IterationCount; i++ {
-      connectionResult := ConnectionResult{ConnectionID: i}
-      clientWaitGroup.Add(1)
-      // 运行于客户端模式
-      runAsClient(&connectionResult, &clientWaitGroup)
-      // 阻塞至本次测试完成
-      clientWaitGroup.Wait()
-      evaluationResult.ClientResults = append(evaluationResult.ClientResults, connectionResult)
-      // 提供 5 秒的等待时间
-      fmt.Printf("client: time to next evaluation = %ds\n", TimeToNextEvaluation)
-      time.Sleep(time.Duration(TimeToNextEvaluation) * time.Second)
-    }
-    // 完成所有测试
-    fmt.Printf("client: %d eavluations done\n", len(evaluationResult.ClientResults))
-    fileName := fmt.Sprintf("group-%d-stream-%d-limit-%d.json", config.GroupNumber, config.NumberOfStreams, config.StreamMultiplexLimit)
-    WriteToJsonFile(fileName, evaluationResult)
-  } else if !opts.Client && opts.Server {
-    // 运行于服务器模式
+  //运行于客户端模式或者服务器模式
+  if options.Client && !options.Server {
+    runAsClient()
+  } else if !options.Client && options.Server {
     runAsServer()
   }
 }
 
-// 判断缓冲区中收到的是否是终止实验的指令。目前使用全 1 缓冲区作为终止实验的指令。
-func isCloseMessage(buf []byte) bool {
-  // 全 1 是关闭 stream 的消息，全 0 是无意义的测试数据
-  return buf[0] == 1
-}
-
-// 从 stream 中接收数据
-func receiveMessage(stream quic.Stream, waitGroup *sync.WaitGroup) {
-  defer waitGroup.Done()
-
-  config := GetConfig()
-
-  // 建立接收缓冲区
-  receiveBuf := make([]byte, config.BufferSize)
-  streamID := stream.StreamID()
-
-  // 不停接受数据直到接收到终止消息
-  var receivedSize int
-  for true {
-    // 从缓冲区中读取数据
-    size, err := io.ReadFull(stream, receiveBuf)
-    receivedSize += size
-    if err != nil && err.Error() != "NO_ERROR" {
-      // 接收过程出错
-      fmt.Printf("stream %d: error in reading message, received size: %d, error: %s\n", streamID, receivedSize, err.Error())
-      break
-    }
-    if isCloseMessage(receiveBuf) {
-      fmt.Printf("stream %d: close message received\n", streamID)
-      break
-    }
-  }
-
-  // 在 server 一侧关闭 stream
-  err := stream.Close()
-  if err != nil {
-    // 关闭过程出错
-    fmt.Printf("stream %d: error in closing this stream\n", streamID)
-  }
-  fmt.Printf("stream %d: closed\n", streamID)
-}
-
 // 服务器主线程
 func runAsServer() {
-  fmt.Println("run as server")
+  logger.Info("run as server")
 
-  config := GetConfig()
+  programConfig := GetProgramConfig()
+
+  // 初始化响应体
+  for _, block := range programConfig.ControlBlockSlice.BlockSlice {
+    MakeResponseBody(block)
+  }
 
   // 添加端口监听, 利用生成的 TLS 数据建立连接
-  serverAddr := config.ServerAddr // Mininet 环境中需指明要监听的地址
-  serverPort := config.ServerPort // 要监听的端口号
-  listener, err := quic.ListenAddr(serverAddr+":"+serverPort, generateTLSConfig(), nil)
+  serverAddr, serverPort := programConfig.Address, programConfig.Port
+  listener, err := quic.ListenAddr(
+    serverAddr+":"+serverPort, GenerateTLSConfig(), nil)
+  defer listener.Close()
   if err != nil {
-    fmt.Printf("fuck error, err: %s\n", err.Error())
+    logger.Errorf("Error in create listener: <%s>, err: %s\n",
+      serverAddr+":"+serverPort, err.Error())
     return
   }
-  fmt.Printf("server: listening at %s\n", serverAddr+":"+serverPort)
+  logger.Infof("listening at <%s>\n", serverAddr+":"+serverPort)
 
   // 循环执行服务器进程，直到被控制台终止
   for true {
@@ -141,202 +90,216 @@ func runAsServer() {
     // 接受外界请求, connection 级
     session, err := listener.Accept(context.Background())
     if err != nil {
+      session.Close()
+      logger.Errorf("Error in establish connection with client: <%s> "+
+        "err: \"%s\"", session.RemoteAddr(), err.Error())
       return
     }
-    fmt.Printf("server: received connection from: %s\n", session.RemoteAddr().String())
+    logger.Infof("server: received connection from: %s\n",
+      session.RemoteAddr().String())
 
     // 只接受指定数目的 stream
-    for i := 0; i < config.NumberOfStreams; i++ {
-      stream, _ := session.AcceptStream(context.Background())
-      if stream != nil {
-        streamWaitGroup.Add(1)
-        fmt.Printf("server: stream %d accepted\n", stream.StreamID())
-        // 转入另外的 go 程接受数据
-        go receiveMessage(stream, &streamWaitGroup)
+    acceptedStreams := 0
+    for acceptedStreams < len(programConfig.ControlBlockSlice.BlockSlice) {
+      stream, err := session.AcceptStream(context.Background())
+      if err != nil {
+        logger.Errorf("Error in accepting stream from: <%s>, "+
+          "err: \"%s\"", session.RemoteAddr(), err.Error())
+        return
       }
+      if stream == nil {
+        logger.Error("get nil stream")
+        return
+      }
+      streamWaitGroup.Add(1)
+      logger.Infof("server: stream %d accepted\n", stream.StreamID())
+      acceptedStreams += 1
+      // 转入另外的 go 程接受数据
+      go handleRequest(&stream, &streamWaitGroup)
     }
 
     // 等待所有的 stream 都终止之后在结束 connection
     streamWaitGroup.Wait()
     // 所有 stream 都已经结束
-    err = session.Close()
-    if err != nil {
-      fmt.Printf("server: error in closing connection, err = %s\n", err.Error())
-    }
-    fmt.Println("server: this connection closed")
+    //err = session.Close()
+    //if err != nil {
+    //  logger.Errorf("server: error in closing connection, err = %s\n",
+    //    err.Error())
+    //  return
+    //}
+    logger.Infof("server: %d stream finished\n", acceptedStreams)
   }
 }
 
-// 在 client 一侧发送数据
-func sendMessage(stream quic.Stream, waitGroup *sync.WaitGroup, streamResultSlice *[]StreamResult) {
-  defer waitGroup.Done()
+// 负责处理请求
+func handleRequest(stream *quic.Stream, streamWaitGroup *sync.WaitGroup) {
+  s := *stream
+  defer streamWaitGroup.Done()
 
-  streamID := stream.StreamID()
-  // 用于保存本 stream 的测试结果
-  streamResult := StreamResult{}
-  streamResult.StreamID = int64(streamID)
+  programConfig := GetProgramConfig()
 
-  config := GetConfig()
-
-  // 创建循环使用的测试数据缓冲区
-  message := make([]byte, config.BufferSize)
-  for i := 0; i < config.BufferSize; i++ {
-    // 使用全 0 来初始化发送缓冲，以和全 1 的终止消息相区别
-    message[i] = 0
-  }
-  fmt.Printf("stream %d: buffer created\n", streamID)
-
-  // 数据流的实际起始时间
-  streamResult.Start = time.Now()
-
-  // 循环发送同一数据块指导发完全部数据量
-  var sentSize int // 已发送的数据量
-  // 只需发送本 stream 所对应的数据区长度
-  for i := 0; i < (config.DataSize/config.NumberOfStreams)/config.BufferSize; i++ {
-    size, err := stream.Write(message)
-    sentSize += size
-    if err != nil {
-      // 发送出错
-      fmt.Printf("stream %d: error in sending messages, %d bytes sent, err: %s\n", streamID, sentSize, err.Error())
-      return
-    }
-  }
-  fmt.Printf("stream %d: message sent\n", streamID)
-
-  // 数据流的实际终止时间
-  streamResult.End = time.Now()
-  // 数据流的实际持续时间
-  streamResult.Total = streamResult.End.Sub(streamResult.Start).Seconds()
-  // 把本 stream 的结果添加到全局结果中
-  *streamResultSlice = append(*streamResultSlice, streamResult)
-
-  // 发送结束信息
-  for i := 0; i < config.BufferSize; i++ {
-    // 全部置 1 以表示结束消息
-    message[i] = 1
-  }
-  _, err := stream.Write(message)
-  if err != nil && err.Error() != "NO_ERROR" {
-    fmt.Printf("stream %d: error in sending close stream message, err: %s\n", streamID, err.Error())
-    return
-  }
-  fmt.Printf("stream %d: stream close message sent\n", stream.StreamID())
-
-  // 关闭此 stream
-  err = stream.Close()
+  // 获取请求的资源 id
+  requestBody := make([]byte, 1*B)
+  _, err := io.ReadFull(s, requestBody)
   if err != nil {
-    fmt.Printf("stream %d: error in closeing this stream, err: %s\n", streamID, err.Error())
+    logger.Errorf("Error in receiving request, stream id: <%d>, "+
+      "err: \"%s\"", s.StreamID(), err.Error())
     return
   }
-  fmt.Printf("stream %d: closed\n", streamID)
+  resourceId := uint16(requestBody[0])
+  controlBlock := GetStreamControlBlockByResourceId(
+    programConfig.ControlBlockSlice, resourceId)
+  logger.Infof("Client requesting resource id: <%d>, request url: "+
+    "\"%s\", resource type: <%s>", controlBlock.ResourceId,
+    controlBlock.RequestUrl, controlBlock.ResourceType)
+
+  size, err := s.Write(controlBlock.ResponseBody)
+  logger.Infof("Response body size <%d>B for resource id <%d>, "+
+    "transmitted size: <%d>B", len(controlBlock.ResponseBody),
+    controlBlock.ResourceId, size)
+  if err != nil {
+    logger.Errorf("Error in sending response, stream id: <%d>, request"+
+      " id: <%d>, sent size: <%d>, error: \"%s\"", s.StreamID(), resourceId,
+      size, err.Error())
+    return
+  }
+  if uint32(size) != controlBlock.ResponseSize {
+    logger.Errorf("Error in sending response, stream id: <%d>, request"+
+      " id: <%d>, sent size: <%d>", s.StreamID(), controlBlock.ResourceId, size)
+    return
+  }
 }
 
 // 作为客户端运行
-func runAsClient(connectionResult *ConnectionResult, clientWaitGroup *sync.WaitGroup) {
-  fmt.Println("run as client")
-
-  // 用于接受各 stream 的结束信号
-  var streamWaitGroup sync.WaitGroup
-  // 用于接收各 stream 的测试结果，当前 slice 为空，后续使用 append 来向其中添加数据
-  var streamResultSlice []StreamResult
+func runAsClient() {
+  logger.Info("Run as client")
 
   // 生成默认 TLS 加密文件
   tlsConf := &tls.Config{
     InsecureSkipVerify: true,
     NextProtos:         []string{"quic-echo-example"},
   }
-  fmt.Println("client: TLS config generated")
+  logger.Info("Client TLS config generated")
 
-  config := GetConfig()
+  programConfig := GetProgramConfig()
 
   // 与服务器建立连接, 建立 connection 级连接
-  serverAddr := config.ServerAddr
-  serverPort := config.ServerPort
-  session, err := quic.DialAddr(serverAddr+":"+serverPort, tlsConf, nil)
+  serverAddr, serverPort := programConfig.Address, programConfig.Port
+  connection, err :=
+    quic.DialAddr(serverAddr+":"+serverPort, tlsConf, nil)
   if err != nil {
-    fmt.Printf("client: error in connecting server, err: %s\n", err.Error())
+    logger.Errorf("client: error in connecting server, err: %s\n",
+      err.Error())
     return
   }
-  fmt.Println("client: connected to server")
+  logger.Info("client: connected to server")
 
+  // 记录实验开始时间
   start := time.Now()
-  fmt.Printf("client: evaluation started at: %s\n", start.Format(time.UnixDate))
+  logger.Infof("client: evaluation started at: %s\n",
+    start.Format(time.UnixDate))
 
-  // 按照设定起指定数量的 stream
-  for i := 0; i < config.NumberOfStreams; i++ {
-    stream, err := session.OpenStreamSync(context.Background())
-    if err != nil {
-      fmt.Printf("cleint: error in creating stream, err: %s\n", err.Error())
-      return
-    }
-    fmt.Printf("client: stream %d created\n", stream.StreamID())
-    streamWaitGroup.Add(1)
-    // 转到另外的 go 程来发送数据
-    go sendMessage(stream, &streamWaitGroup, &streamResultSlice)
-  }
+  scheduler := programConfig.Scheduler
+  // 调整 root request 的状态为就绪状态
+  rootRequestBlock := GetStreamControlBlockByUrl(
+    programConfig.ControlBlockSlice, programConfig.RootRequestUrl)
+  rootRequestBlock.EnqueuedAt = time.Now().Unix()
+  scheduler.PendingRequest = rootRequestBlock
+  newStream, _ := connection.OpenStreamSync(context.Background())
+  // 发起 root request
+  go sendRequest(&newStream, rootRequestBlock)
+  logger.Info("root request sent")
 
-  // 处理连接的结束
-  streamWaitGroup.Wait()
-  err = session.Close()
-  if err != nil {
-    fmt.Println("client: error in closing connection")
-    return
-  }
-  fmt.Println("client: connection closed")
+  logger.Infof("before loop")
+  for !ReplayFinished(programConfig.ControlBlockSlice) {
+    select {
+    case finished := <-programConfig.SignalChan:
+      {
+        logger.Infof("request id <%d> finished and passed by signal chan",
+          finished.ResourceId)
+        nextRequest := scheduler.PopNextRequest(programConfig.ControlBlockSlice)
+        if nextRequest == nil {
+          // 全部请求回放完毕
+          logger.Info("all finished")
+          break
+        }
 
-  // 所有 stream 的最早开始时间
-  minStartTime := streamResultSlice[0].Start
-  // 所有 stream 的最晚结束时间
-  maxEndTime := streamResultSlice[0].Start
-  // 计算此链接发送数据部分所需要的时间
-  for i := 1; i < len(streamResultSlice); i++ {
-    r := streamResultSlice[i]
-    if r.Start.Before(minStartTime) {
-      minStartTime = r.Start
-    }
-    if r.End.After(maxEndTime) {
-      maxEndTime = r.End
+        logger.Infof("next resource id <%d>", nextRequest.ResourceId)
+        newStream, _ := connection.OpenStreamSync(context.Background())
+        nextRequest.StartedAt = time.Now().Unix()
+        // 在新起的 stream 上发送请求
+        go sendRequest(&newStream, nextRequest)
+      }
     }
   }
+  logger.Infof("after loop")
 
-  // 对结果集进行排序
-  sort.Slice(streamResultSlice, func(i, j int) bool {
-    return streamResultSlice[i].StreamID < streamResultSlice[j].StreamID
-  })
-
-  // 输出所有结果
-  for _, r := range streamResultSlice {
-    fmt.Println(r.String())
-  }
-
-  // 把实验结果添加到全局结果集中
-  connectionResult.StreamResultSlice = streamResultSlice
-  // 打印测试时间
-  fmt.Printf("client: evaluation takes %f seconds to finish\n", maxEndTime.Sub(minStartTime).Seconds())
-  // 通知上层
-  clientWaitGroup.Done()
+  //for !ReplayFinished(programConfig.ControlBlockSlice) {
+  //  if nextRequest != nil {
+  //  }
+  //}
 }
 
-// 生成 TLS 证书
-func generateTLSConfig() *tls.Config {
-  key, err := rsa.GenerateKey(rand.Reader, 1024)
-  if err != nil {
-    panic(err)
-  }
-  template := x509.Certificate{SerialNumber: big.NewInt(1)}
-  certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
-  if err != nil {
-    panic(err)
-  }
-  keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})
-  certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
+// client 发送请求
+func sendRequest(stream *quic.Stream, block *StreamControlBlock) {
+  s := *stream
 
-  tlsCert, err := tls.X509KeyPair(certPEM, keyPEM)
+  logger.Infof("sending request for resource id: <%d>", block.ResourceId)
+
+  // 登记开始时间
+  block.StartedAt = time.Now().Unix()
+  // 请求指定的资源
+  requestBody := make([]byte, 1, 1)
+  // 填充 requestBody
+  Memset(&requestBody, uint8(block.ResourceId))
+
+  // 发送请求
+  _, err := s.Write(requestBody)
   if err != nil {
-    panic(err)
+    logger.Error(
+      "Error in sending request for stream: <%d>, requestId: <%d>, "+
+        "error: \"%s\"", s.StreamID(), block.ResourceId, err.Error())
+    return
   }
-  return &tls.Config{
-    Certificates: []tls.Certificate{tlsCert},
-    NextProtos:   []string{"quic-echo-example"},
+
+  logger.Infof("request for resource id: <%d> sent", block.ResourceId)
+
+  // 创建大小为 1KB 的接收缓冲区，每次实际接收到的字节数由 size 决定
+  receiveBuf := make([]byte, 1*KB)
+  // 已经接收到的字节数
+  receivedSize := 0
+  receivedBytes := make([]byte, 0, block.ResponseSize)
+  for uint32(receivedSize) < block.ResponseSize {
+    size, err := io.ReadAtLeast(s, receiveBuf, 1)
+    if err != nil {
+      logger.Error("Error in receiving response from stream: <%d>, "+
+        "request id: <%d>, error: \"%s\"",
+        s.StreamID(), block.ResourceId, err.Error())
+      return
+    }
+    // 处理成功接收到的数据
+    receivedBytes = append(receivedBytes, receiveBuf[:size]...)
+    receivedSize += size
   }
+
+  logger.Infof("request for resource id: <%d> received", block.ResourceId)
+
+  // 检查收到的 response body 是否有错
+  if !ValidateResponse(&receivedBytes, block.ResponseSize,
+    block.ResourceId) {
+    logger.Error("Validation failed for stream: <%d>, request id: <%d>",
+      s.StreamID(), block.ResourceId)
+    return
+  }
+
+  logger.Infof("request for resource id: <%d> validated", block.ResourceId)
+
+  // stream 已完成，触发 stream 状态更新事件
+  programConfig := GetProgramConfig()
+  programConfig.Scheduler.
+    OnStreamFinished(block, programConfig.ControlBlockSlice)
+  // 向 signal chan 发送信号，以启动下一请求
+  programConfig.SignalChan <- block
+
+  logger.Infof("request for resource id: <%d> finished", block.ResourceId)
 }

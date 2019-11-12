@@ -1,7 +1,6 @@
-package common
+package datastructures
 
 import (
-  "github.com/stormlin/qperf/config"
   "sync"
 )
 
@@ -43,45 +42,35 @@ type StreamControlBlock struct {
 }
 
 type StreamControlBlockSlice struct {
-  sync.Mutex
+  Mutex      *sync.Mutex
   BlockSlice []*StreamControlBlock
 }
 
-var controlBlockSlice StreamControlBlockSlice
-
-// 按照请求日志文件的要求初始化空白控制块
-func BuildStreamControlBlockSlice(filteredEntries *[]config.FilteredEntry,
-  runAsServer bool) *StreamControlBlockSlice {
-  for _, entry := range *filteredEntries {
-    block := StreamControlBlock{
-      ResourceId:    uint16(entry.ResourceId),
-      RequestUrl:    entry.RequestUrl,
-      ResponseSize:  uint32(entry.ResponseSize),
-      RemainingSize: uint32(entry.RemainingSize),
-      ResourceType:  entry.ResourceType,
-      TTFB:          entry.TTFB,
-      Dependencies:  entry.Dependencies,
-      Hostname:      entry.Hostname,
-      Method:        entry.Method,
-      IsStarted:     entry.IsStarted,
-      ServerDelay:   entry.ServerDelay,
-    }
-    if runAsServer {
-      block.ResponseBody = make([]byte, 0, entry.ResponseSize)
-      // 只在 server 一侧初始化 response body 以节省内存空间
-      Memset(&block.ResponseBody, uint8(block.ResourceId))
-    }
-    // 把此 block 添加到 block slice 中，以便供其他模块使用
-    controlBlockSlice.BlockSlice = append(controlBlockSlice.BlockSlice, &block)
+func GetNewControlBlockSlice(capacity int) *StreamControlBlockSlice {
+  return &StreamControlBlockSlice{
+    Mutex:      &sync.Mutex{},
+    BlockSlice: make([]*StreamControlBlock, 0, capacity),
   }
-  return &controlBlockSlice
+}
+
+// 是否已经回放所有请求
+func ReplayFinished(slice *StreamControlBlockSlice) bool {
+  defer slice.Mutex.Unlock()
+  slice.Mutex.Lock()
+  for _, block := range slice.BlockSlice {
+    if block.Status != FINISHED {
+      return false
+    }
+  }
+  return true
 }
 
 // 以 request url 为 key 查找 control block
-func GetStreamControlBlockByUrl(url string) *StreamControlBlock {
-  defer controlBlockSlice.Unlock()
-  controlBlockSlice.Lock()
-  for _, stream := range controlBlockSlice.BlockSlice {
+func GetStreamControlBlockByUrl(
+  slice *StreamControlBlockSlice, url string) *StreamControlBlock {
+  defer slice.Mutex.Unlock()
+  slice.Mutex.Lock()
+  for _, stream := range slice.BlockSlice {
     if stream.RequestUrl == url {
       return stream
     }
@@ -90,34 +79,14 @@ func GetStreamControlBlockByUrl(url string) *StreamControlBlock {
 }
 
 // 以 resource id 为 key 查找 control block
-func GetStreamControlBlockByResourceId(id uint16) *StreamControlBlock {
-  defer controlBlockSlice.Unlock()
-  controlBlockSlice.Lock()
-  for _, block := range controlBlockSlice.BlockSlice {
+func GetStreamControlBlockByResourceId(
+  slice *StreamControlBlockSlice, id uint16) *StreamControlBlock {
+  defer slice.Mutex.Unlock()
+  slice.Mutex.Lock()
+  for _, block := range slice.BlockSlice {
     if block.ResourceId == id {
       return block
     }
   }
   return nil
 }
-//
-//// 活跃 stream 队列
-//type StreamControlBlockQueue struct {
-//  queue []*StreamControlBlock
-//}
-//
-//// 可供发送的请求队列
-//var requestsToSent StreamControlBlockQueue
-//
-//func (asq *StreamControlBlockQueue) Put(block *StreamControlBlock) {
-//  asq.queue = append(asq.queue, block)
-//}
-//
-//func (asq *StreamControlBlockQueue) Get() *StreamControlBlock {
-//  if len(asq.queue) <= 0 {
-//    return nil
-//  }
-//  item := asq.queue[0]
-//  asq.queue = asq.queue[1:]
-//  return item
-//}

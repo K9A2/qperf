@@ -1,36 +1,14 @@
-package config
+package common
 
 import (
   "encoding/json"
   "github.com/google/logger"
   "github.com/jessevdk/go-flags"
-  "github.com/stormlin/qperf/datastructures"
-  "github.com/stormlin/qperf/schedulers"
+  . "github.com/stormlin/qperf/constants"
+  . "github.com/stormlin/qperf/datastructures"
+  . "github.com/stormlin/qperf/schedulers"
   "io/ioutil"
   "os"
-)
-
-const (
-  // 数据块大小定义
-  B  = 1
-  KB = B * 1e3
-  MB = KB * 1e3
-  GB = MB * 1e3
-)
-
-const (
-  // 两次测试之间的等待时间
-  TimeToNextEvaluation = 5
-)
-
-// 资源类型常量
-const (
-  DOCUMENT   = "document"
-  STYLESHEET = "stylesheet"
-  SCRIPT     = "script"
-  IMAGE      = "image"
-  XHR        = "xhr"
-  OTHER      = "other"
 )
 
 // 打印程序用法
@@ -111,16 +89,17 @@ type ProgramConfig struct {
   RootRequestUrl string
 
   // 控制块，保存各 request 的信息
-  ControlBlockSlice *datastructures.StreamControlBlockSlice
+  ControlBlockSlice *StreamControlBlockSlice
   // 默认使用 chrome dynamic fcfs 调度器
-  Scheduler *schedulers.DynamicFcfsScheduler
+  Scheduler *DynamicFcfsScheduler
+  // 用来发送 stream 完成信息
+  SignalChan chan *StreamControlBlock
 
   // 关于 quic-go 的配置项
   StreamMultiplexLimit int // 每个 QUIC Packet 包能复用的最大 stream 数目
 
   // client 模式下的配置项
-  GroupNumber          int    // 当前实验是第几组，用于输出 JSON 测试文件
-  FirstImageResourceId uint16 // 第一张图片的 resource id，用于实现 dynamic fcfs scheduler
+  GroupNumber int // 当前实验是第几组，用于输出 JSON 测试文件
 }
 
 // 全局共享的配置文件
@@ -199,7 +178,10 @@ func ParseWConfigFile(filePath string) *WConfig {
   return &wConfig
 }
 
-// 创建程序配置项对象
+type StreamFinishSignalChan struct {
+}
+
+// 在初始化阶段创建程序配置项对象
 func BuildProgramConfig(options *Options) *ProgramConfig {
   qConfig := ParseQConfigFile(options.QConfig)
   if qConfig == nil {
@@ -220,27 +202,31 @@ func BuildProgramConfig(options *Options) *ProgramConfig {
   programConfig.Port = options.Port
   programConfig.IterationCount = q.IterationCount
   programConfig.RootRequestUrl = w.RootRequestUrl
-  programConfig.ControlBlockSlice = datastructures.BuildStreamControlBlockSlice(
-    &w.FilteredEntries, options.Server)
+  programConfig.ControlBlockSlice =
+    BuildStreamControlBlockSlice(&w.FilteredEntries)
   programConfig.StreamMultiplexLimit = q.StreamMultiplexLimit
   programConfig.GroupNumber = q.GroupNumber
-  programConfig.Scheduler = &schedulers.DynamicFcfsScheduler{}
-  programConfig.FirstImageResourceId = getFirstImageResourceId(
+  programConfig.Scheduler = NewDynamicFcfsScheduler(
+    getFirstImageResourceId(programConfig.ControlBlockSlice),
+    len(programConfig.ControlBlockSlice.BlockSlice))
+  programConfig.Scheduler.FirstImageResourceId = getFirstImageResourceId(
     programConfig.ControlBlockSlice)
+  programConfig.SignalChan = make(chan *StreamControlBlock)
 
   return &programConfig
 }
 
+// 在程序初始化之后提供获取配置对象的入口
+func GetProgramConfig() *ProgramConfig {
+  return &programConfig
+}
+
 // 获取第一张图片的 resource id，-1 表示此请求不含图片
-func getFirstImageResourceId(slice *datastructures.StreamControlBlockSlice) uint16 {
+func getFirstImageResourceId(slice *StreamControlBlockSlice) uint16 {
   for _, block := range slice.BlockSlice {
     if block.ResourceType == IMAGE {
       return block.ResourceId
     }
   }
   return 0
-}
-
-func GetProgramConfig() *ProgramConfig {
-  return &programConfig
 }
