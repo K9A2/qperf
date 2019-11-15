@@ -208,9 +208,7 @@ func runAsClient() {
   newStream, _ := connection.OpenStreamSync(context.Background())
   // 发起 root request
   go sendRequest(&newStream, rootRequestBlock)
-  logger.Info("root request sent")
 
-  logger.Infof("before loop")
   for !ReplayFinished(programConfig.ControlBlockSlice) {
     select {
     case finished := <-programConfig.SignalChan:
@@ -232,19 +230,11 @@ func runAsClient() {
       }
     }
   }
-  logger.Infof("after loop")
-
-  //for !ReplayFinished(programConfig.ControlBlockSlice) {
-  //  if nextRequest != nil {
-  //  }
-  //}
 }
 
 // client 发送请求
 func sendRequest(stream *quic.Stream, block *StreamControlBlock) {
   s := *stream
-
-  logger.Infof("sending request for resource id: <%d>", block.ResourceId)
 
   // 登记开始时间
   block.StartedAt = time.Now().Unix()
@@ -261,8 +251,6 @@ func sendRequest(stream *quic.Stream, block *StreamControlBlock) {
         "error: \"%s\"", s.StreamID(), block.ResourceId, err.Error())
     return
   }
-
-  logger.Infof("request for resource id: <%d> sent", block.ResourceId)
 
   // 创建大小为 1KB 的接收缓冲区，每次实际接收到的字节数由 size 决定
   receiveBuf := make([]byte, 1*KB)
@@ -282,8 +270,6 @@ func sendRequest(stream *quic.Stream, block *StreamControlBlock) {
     receivedSize += size
   }
 
-  logger.Infof("request for resource id: <%d> received", block.ResourceId)
-
   // 检查收到的 response body 是否有错
   if !ValidateResponse(&receivedBytes, block.ResponseSize,
     block.ResourceId) {
@@ -291,8 +277,6 @@ func sendRequest(stream *quic.Stream, block *StreamControlBlock) {
       s.StreamID(), block.ResourceId)
     return
   }
-
-  logger.Infof("request for resource id: <%d> validated", block.ResourceId)
 
   // stream 已完成，触发 stream 状态更新事件
   programConfig := GetProgramConfig()

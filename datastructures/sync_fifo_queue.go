@@ -1,7 +1,6 @@
 package datastructures
 
 import (
-  "github.com/google/logger"
   "sync"
 )
 
@@ -23,12 +22,7 @@ func (sfq *SyncFifoQueue) Size() int {
 
 func (sfq *SyncFifoQueue) Empty() bool {
   result := sfq.Size() <= 0
-  logger.Infof("empty: result <%d>", result)
   return result
-  //if sfq.Size() <= 0 {
-  //  return true
-  //}
-  //return false
 }
 
 func (sfq *SyncFifoQueue) Put(block *StreamControlBlock) {
