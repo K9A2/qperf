@@ -9,6 +9,7 @@ import (
   "github.com/stormlin/qperf/quic-go"
   "io"
   "sync"
+  "time"
 )
 
 //var serverWaitGroup sync.WaitGroup
@@ -107,10 +108,15 @@ func handleRequest(stream *quic.Stream, streamWaitGroup *sync.WaitGroup) {
     "\"%s\", resource type: <%s>", controlBlock.ResourceId,
     controlBlock.RequestUrl, controlBlock.ResourceType)
 
+  // 模拟 server 生成 response body 所需要的时间
+  time.Sleep(100 * time.Millisecond)
+  serverDelay := controlBlock.ServerDelay
+  time.Sleep(time.Duration(serverDelay) * time.Millisecond)
+
   size, err := s.Write(controlBlock.ResponseBody)
   logger.Infof("Response body size <%d>B for resource id <%d>, "+
-    "transmitted size: <%d>B", len(controlBlock.ResponseBody),
-    controlBlock.ResourceId, size)
+    "transmitted size: <%d>B, server delay: <%.3f>",
+    len(controlBlock.ResponseBody), controlBlock.ResourceId, size, serverDelay)
   if err != nil {
     logger.Errorf("Error in sending response, stream id: <%d>, request"+
       " id: <%d>, sent size: <%d>, error: \"%s\"", s.StreamID(), resourceId,
@@ -123,4 +129,3 @@ func handleRequest(stream *quic.Stream, streamWaitGroup *sync.WaitGroup) {
     return
   }
 }
-
