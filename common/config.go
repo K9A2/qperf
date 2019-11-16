@@ -94,6 +94,8 @@ type ProgramConfig struct {
   Scheduler *DynamicFcfsScheduler
   // 用来发送 stream 完成信息
   SignalChan chan *StreamControlBlock
+  // 数据收集器
+  Collector *dataCollector
 
   // 关于 quic-go 的配置项
   StreamMultiplexLimit int // 每个 QUIC Packet 包能复用的最大 stream 数目
@@ -204,14 +206,16 @@ func BuildProgramConfig(options *Options) *ProgramConfig {
   programConfig.RootRequestUrl = w.RootRequestUrl
   programConfig.ControlBlockSlice =
     BuildStreamControlBlockSlice(&w.FilteredEntries)
+
+  capacity := len(programConfig.ControlBlockSlice.BlockSlice)
   programConfig.StreamMultiplexLimit = q.StreamMultiplexLimit
   programConfig.GroupNumber = q.GroupNumber
   programConfig.Scheduler = NewDynamicFcfsScheduler(
-    getFirstImageResourceId(programConfig.ControlBlockSlice),
-    len(programConfig.ControlBlockSlice.BlockSlice))
+    getFirstImageResourceId(programConfig.ControlBlockSlice), capacity)
   programConfig.Scheduler.FirstImageResourceId = getFirstImageResourceId(
     programConfig.ControlBlockSlice)
   programConfig.SignalChan = make(chan *StreamControlBlock)
+  programConfig.Collector = DataCollector(capacity)
 
   return &programConfig
 }

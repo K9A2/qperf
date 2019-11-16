@@ -97,7 +97,7 @@ func (scheduler *DynamicFcfsScheduler) enqueueAllAvailableRequests(
       dependenciesMet(block, blockSlice) {
       // 让就绪的 block 入队，等候调度发送
       block.Status = ENQUEUED
-      block.EnqueuedAt = time.Now().Unix()
+      block.EnqueuedAt = time.Now().UnixNano()
       scheduler.enqueue(block)
       enqueuedRequests += 1
     }
@@ -170,7 +170,16 @@ func (scheduler *DynamicFcfsScheduler) OnStreamFinished(
   scheduler.PendingRequest = nil
   // 调整该请求状态为已完成状态
   finishedBlock.Status = FINISHED
-  finishedBlock.FinishedAt = time.Now().Unix()
+  // 计算结束时间和传输耗时
+  finishedBlock.FinishedAt = time.Now().UnixNano()
+  finishedBlock.QueuedFor = finishedBlock.StartedAt - finishedBlock.EnqueuedAt
+  finishedBlock.TransmissionTime = finishedBlock.FinishedAt - finishedBlock.StartedAt
+  //logger.Infof("request id: <%d>", finishedBlock.ResourceId)
+  //logger.Infof("  enqueued_at: <%d>", finishedBlock.EnqueuedAt)
+  //logger.Infof("  started_at: <%d>", finishedBlock.StartedAt)
+  //logger.Infof("  queued_for: <%d>", finishedBlock.QueuedFor)
+  //logger.Infof("  finished_at: <%d>", finishedBlock.FinishedAt)
+  //logger.Infof("  transmission_time: <%d>", finishedBlock.TransmissionTime)
   // 让就绪请求入队
   scheduler.enqueueAllAvailableRequests(blockSlice)
   scheduler.Mutex.Unlock()

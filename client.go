@@ -47,7 +47,7 @@ func runAsClient() {
   // 调整 root request 的状态为就绪状态
   rootRequestBlock := GetStreamControlBlockByUrl(
     programConfig.ControlBlockSlice, programConfig.RootRequestUrl)
-  rootRequestBlock.EnqueuedAt = time.Now().Unix()
+  rootRequestBlock.EnqueuedAt = time.Now().UnixNano()
   scheduler.PendingRequest = rootRequestBlock
   newStream, _ := connection.OpenStreamSync(context.Background())
   // 发起 root request
@@ -57,23 +57,34 @@ func runAsClient() {
     select {
     case finished := <-programConfig.SignalChan:
       {
-        logger.Infof("request id <%d> finished and passed by signal chan",
-          finished.ResourceId)
+        programConfig.Collector.AddNewFinishedStream(finished)
         nextRequest := scheduler.PopNextRequest(programConfig.ControlBlockSlice)
         if nextRequest == nil {
           // 全部请求回放完毕
           logger.Info("all finished")
           break
         }
-
-        logger.Infof("next resource id <%d>", nextRequest.ResourceId)
         newStream, _ := connection.OpenStreamSync(context.Background())
-        nextRequest.StartedAt = time.Now().Unix()
+        nextRequest.StartedAt = time.Now().UnixNano()
         // 在新起的 stream 上发送请求
         go sendRequest(&newStream, nextRequest)
       }
     }
   }
+
+  end := time.Now()
+  logger.Infof("evaluation finished, time: <%.3f>s",
+    float64(end.Sub(start).Milliseconds())/1000.0)
+
+  // 打印性能测试数据
+  report := programConfig.Collector.GetTimingReport()
+  PrintTimingReport(report.DocumentReport, DOCUMENT)
+  PrintTimingReport(report.StylesheetReport, STYLESHEET)
+  PrintTimingReport(report.XhrReport, XHR)
+  PrintTimingReport(report.ScriptReport, SCRIPT)
+  PrintTimingReport(report.ImageReport, IMAGE)
+  PrintTimingReport(report.OtherReport, OTHER)
+
 }
 
 // client 发送请求
@@ -81,7 +92,7 @@ func sendRequest(stream *quic.Stream, block *StreamControlBlock) {
   s := *stream
 
   // 登记开始时间
-  block.StartedAt = time.Now().Unix()
+  block.StartedAt = time.Now().UnixNano()
   // 请求指定的资源
   requestBody := make([]byte, 1, 1)
   // 填充 requestBody
@@ -129,5 +140,6 @@ func sendRequest(stream *quic.Stream, block *StreamControlBlock) {
   // 向 signal chan 发送信号，以启动下一请求
   programConfig.SignalChan <- block
 
-  logger.Infof("request for resource id: <%d> finished", block.ResourceId)
+  logger.Infof("request for resource id: <%d> finished, type: <%s>",
+    block.ResourceId, block.ResourceType)
 }
