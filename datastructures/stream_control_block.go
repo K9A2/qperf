@@ -26,7 +26,7 @@ type StreamControlBlock struct {
   ResourceType  string  // 资源类型
   TTFB          float32 // time to first byte
   Dependencies  []int   // 依赖项的 ResourceId
-  Hostname      string  // 资源所在主机名
+  Domain        string  // 资源所在主机名
   Method        string  // 请求方式
   IsStarted     bool    // 是否已经开始
   ServerDelay   float32 // 此资源就绪所耗时间

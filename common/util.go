@@ -24,7 +24,7 @@ func BuildStreamControlBlockSlice(
       ResourceType:  entry.ResourceType,
       TTFB:          entry.TTFB,
       Dependencies:  entry.Dependencies,
-      Hostname:      entry.Hostname,
+      Domain:        entry.Domain,
       Method:        entry.Method,
       IsStarted:     entry.IsStarted,
       ServerDelay:   entry.ServerDelay,

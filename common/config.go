@@ -49,7 +49,7 @@ type FilteredEntry struct {
   ResourceType  string  `json:"resource_type"`
   TTFB          float32 `json:"ttfb"`
   Dependencies  []int   `json:"dependencies"`
-  Hostname      string  `json:"hostname"`
+  Domain        string  `json:"domain"`
   Method        string  `json:"method"`
   IsStarted     bool    `json:"is_started"`
   ServerDelay   float32 `json:"server_delay"`
