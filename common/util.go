@@ -8,6 +8,7 @@ import (
   "encoding/pem"
   . "github.com/stormlin/qperf/datastructures"
   "math/big"
+  "strconv"
 )
 
 // 按照请求日志文件的要求初始化空白控制块
@@ -95,4 +96,25 @@ func GenerateTLSConfig() *tls.Config {
     Certificates: []tls.Certificate{tlsCert},
     NextProtos:   []string{"quic-echo-example"},
   }
+}
+
+func BuildServerControlBlockSlice(
+  entries *[]FilteredEntry) *map[string]*ServerControlBlock {
+  // 用于在遍历过程中暂存各 server control block
+  blockMap := make(map[string]*ServerControlBlock)
+  // 下一个子服务器的端口号，以后每一个子服务器的端口号在此基础上加 1
+  nextServerPort := MinServerPort
+  // 遍历原始数据以按顺序找出所有 domain
+  for _, e := range *entries {
+    if _, exists := blockMap[e.Domain]; !exists {
+      // 首次读到这个 block 相关的信息，需要为其创建 control block 并分配端口号
+      newBlock := NewServerControlBlock(e.Domain, strconv.Itoa(nextServerPort))
+      newBlock.RequestCount = 1
+      blockMap[e.Domain] = newBlock
+      nextServerPort += 1
+    } else {
+      blockMap[e.Domain].RequestCount += 1
+    }
+  }
+  return &blockMap
 }

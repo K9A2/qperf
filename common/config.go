@@ -80,11 +80,10 @@ type Options struct {
 }
 
 // 全部可调的程序配置项
-type ProgramConfig struct {
+type programConfig struct {
   // 公共配置项
   Verbose        bool
   Address        string
-  Port           string
   IterationCount int
   RootRequestUrl string
 
@@ -96,6 +95,8 @@ type ProgramConfig struct {
   SignalChan chan *StreamControlBlock
   // 数据收集器
   Collector *dataCollector
+  // domain 名字与 id 之间的映射关系
+  ServerControlBlockMap *map[string]*ServerControlBlock
 
   // 关于 quic-go 的配置项
   StreamMultiplexLimit int // 每个 QUIC Packet 包能复用的最大 stream 数目
@@ -105,7 +106,7 @@ type ProgramConfig struct {
 }
 
 // 全局共享的配置文件
-var programConfig ProgramConfig
+var config programConfig
 
 // 解析命令行选项
 func ParseOptions() (*Options, error) {
@@ -184,7 +185,7 @@ type StreamFinishSignalChan struct {
 }
 
 // 在初始化阶段创建程序配置项对象
-func BuildProgramConfig(options *Options) *ProgramConfig {
+func BuildProgramConfig(options *Options) *programConfig {
   qConfig := ParseQConfigFile(options.QConfig)
   if qConfig == nil {
     logger.Errorf("Error in loading QConfig file, err: \"%s\"\n")
@@ -199,30 +200,31 @@ func BuildProgramConfig(options *Options) *ProgramConfig {
   }
   w := *wConfig
 
-  programConfig.Verbose = options.Verbose
-  programConfig.Address = options.Address
-  programConfig.Port = options.Port
-  programConfig.IterationCount = q.IterationCount
-  programConfig.RootRequestUrl = w.RootRequestUrl
-  programConfig.ControlBlockSlice =
+  config.Verbose = options.Verbose
+  config.Address = options.Address
+  config.IterationCount = q.IterationCount
+  config.RootRequestUrl = w.RootRequestUrl
+  config.ControlBlockSlice =
     BuildStreamControlBlockSlice(&w.FilteredEntries)
 
-  capacity := len(programConfig.ControlBlockSlice.BlockSlice)
-  programConfig.StreamMultiplexLimit = q.StreamMultiplexLimit
-  programConfig.GroupNumber = q.GroupNumber
-  programConfig.Scheduler = NewDynamicFcfsScheduler(
-    getFirstImageResourceId(programConfig.ControlBlockSlice), capacity)
-  programConfig.Scheduler.FirstImageResourceId = getFirstImageResourceId(
-    programConfig.ControlBlockSlice)
-  programConfig.SignalChan = make(chan *StreamControlBlock)
-  programConfig.Collector = DataCollector(capacity)
+  capacity := len(config.ControlBlockSlice.BlockSlice)
+  config.StreamMultiplexLimit = q.StreamMultiplexLimit
+  config.GroupNumber = q.GroupNumber
+  config.Scheduler = NewDynamicFcfsScheduler(
+    getFirstImageResourceId(config.ControlBlockSlice), capacity)
+  config.Scheduler.FirstImageResourceId =
+    getFirstImageResourceId(config.ControlBlockSlice)
+  config.SignalChan = make(chan *StreamControlBlock)
+  config.Collector = DataCollector(capacity)
+  config.ServerControlBlockMap =
+    BuildServerControlBlockSlice(&w.FilteredEntries)
 
-  return &programConfig
+  return &config
 }
 
 // 在程序初始化之后提供获取配置对象的入口
-func GetProgramConfig() *ProgramConfig {
-  return &programConfig
+func GetProgramConfig() *programConfig {
+  return &config
 }
 
 // 获取第一张图片的 resource id，-1 表示此请求不含图片

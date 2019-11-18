@@ -21,7 +21,6 @@ func main() {
   config := BuildProgramConfig(options)
   logger.Infof("param <IterationCount> = %d\n", config.IterationCount)
   logger.Infof("param <ServerAddr> = %s\n", config.Address)
-  logger.Infof("param <ServerPort> = %s\n", config.Port)
   logger.Infof("param <StreamMultiplexLimit> = %d\n", config.StreamMultiplexLimit)
   logger.Infof("param <GroupNumber> = %d\n", config.GroupNumber)
   escapedUrl, _ := url.QueryUnescape(config.RootRequestUrl)
@@ -50,4 +49,3 @@ func main() {
     runAsServer()
   }
 }
-
