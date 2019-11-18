@@ -76,7 +76,6 @@ type Options struct {
   Verbose bool `short:"v" long:"verbose" description:"enable verbose output"`
   // 服务器的 IP 地址与端口号
   Address string `short:"a" long:"address" description:"address for server"`
-  Port    string `short:"p" long:"port" description:"port for server"`
 }
 
 // 全部可调的程序配置项
