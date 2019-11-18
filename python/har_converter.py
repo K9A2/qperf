@@ -92,7 +92,7 @@ def get_filtered_entries(original_entries, root_request):
       'dependencies': get_request_dependencies(
         entry['_initiator'], root_request, request_url_to_resource_id_map),
       # 对端主机名
-      'hostname': urlparse(request_url)[1],
+      'domain': urlparse(request_url)[1],
       # 请求方式
       'method': entry['request']['method'],
       # 入队时间
@@ -531,8 +531,8 @@ def get_request_by_url(filtered_requests, target_request):
       return entry
 
 
-def ping(hostname, count=5):
-  p = Popen(['ping', hostname, '-c %s' % count], stdout=PIPE)
+def ping(domain, count=5):
+  p = Popen(['ping', domain, '-c %s' % count], stdout=PIPE)
   ping_result = str(p.communicate()[0])
   # 从 ping 结果中提取系统提供的 rtt 统计数据
   rtt_statistics_str = \
@@ -542,25 +542,25 @@ def ping(hostname, count=5):
   return float(avg_rtt)
 
 
-def get_hostname_average_rtt(extracted_har_object):
+def get_domain_average_rtt(extracted_har_object):
   """
   获取所有主机的平均 rtt 数据
   :param extracted_har_object: 数据集对象
   """
-  ping_hostname_list = []
+  domain_list = []
   for request in extracted_har_object['filtered_entries']:
-    ping_hostname_list.append(request['hostname'])
+    domain_list.append(request['domain'])
   # 去重后求各域名的平均 rtt
-  ping_hostname_list = list(set(ping_hostname_list))
+  domain_list = list(set(domain_list))
   ping_result = {}
   # 创建一个等长的资源池
-  pool = Pool(len(ping_hostname_list))
-  ping_result_list = pool.map(ping, ping_hostname_list)
-  for i in range(len(ping_hostname_list)):
-    ping_result[ping_hostname_list[i]] = ping_result_list[i]
+  pool = Pool(len(domain_list))
+  ping_result_list = pool.map(ping, domain_list)
+  for i in range(len(domain_list)):
+    ping_result[domain_list[i]] = ping_result_list[i]
   # 把收集到的 rtt 数据更新到数据集中，并计算 server_delay
   for entry in extracted_har_object['filtered_entries']:
-    entry['server_delay'] = entry['ttfb'] - ping_result[entry['hostname']]
+    entry['server_delay'] = entry['ttfb'] - ping_result[entry['domain']]
 
 
 def compute_queue_and_transmission_time(filtered_entries):
@@ -659,8 +659,8 @@ def replay_requests():
   # 在获取了所有的依赖项之后，就可以按照依赖项顺序回放各请求了
 
   # 计算服务器生成响应的延迟
-  # print('retrieving average rtt for all hostname')
-  # get_hostname_average_rtt(extracted_har_object)
+  print('retrieving average rtt for all domains')
+  get_domain_average_rtt(extracted_har_object)
 
   # 重放请求以获取各项指标
   replay_log = replay(extracted_har_object)
@@ -744,8 +744,8 @@ def main(argv):
   # 在获取了所有的依赖项之后，就可以按照依赖项顺序回放各请求了
 
   # 计算服务器生成响应的延迟
-  print('retrieving average rtt for all hostname')
-  get_hostname_average_rtt(extracted_har_object)
+  print('retrieving average rtt for all domains')
+  get_domain_average_rtt(extracted_har_object)
 
   # 保存数据到输出文件中
   print('dumping result to config file: <%s>' % output_file_path)
