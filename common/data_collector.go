@@ -42,13 +42,10 @@ func DataCollector(capacity int) *dataCollector {
   }
 }
 
-// 向数据收集器中添加一条新的记录
-func (collector *dataCollector) AddNewFinishedStream(
-  stream *StreamControlBlock) {
-  defer collector.finishedStreams.Mutex.Unlock()
-  collector.finishedStreams.Mutex.Lock()
-  collector.finishedStreams.BlockSlice =
-    append(collector.finishedStreams.BlockSlice, stream)
+// 向数据收集器中添加已经完成的 stream
+func (collector *dataCollector) OnConnectionFinish(
+  slice *StreamControlBlockSlice) {
+  collector.finishedStreams = slice
 }
 
 // 计算指定类别资源的时间统计数据
@@ -103,10 +100,17 @@ func (collector *dataCollector) GetTimingReport() *timingReport {
 func PrintTimingReport(timingStatistics *streamStatistics, resourceType string) {
   logger.Infof("resource type: <%s>", resourceType)
   logger.Infof("  RequestCount:     <%d>", timingStatistics.RequestCount)
-  logger.Infof("  avg ResponseSize: <%.3f>KB", float64(timingStatistics.ResponseSize) / 1000.0)
-  //logger.Infof("  EnqueuedAt:       <%s>", time.Unix(0, streamStatistics.EnqueuedAt).Date())
+  logger.Infof("  avg ResponseSize: <%.3f>KB", float64(timingStatistics.ResponseSize)/1000.0)
   logger.Infof("  avg QueuedFor:        <%d>ms", timingStatistics.QueuedFor/1e6)
-  //logger.Infof("  StartedAt:        <%s>", time.Unix(0, streamStatistics.StartAt).Date())
-  //logger.Infof("  FinishedAt:       <%s>", time.Unix(0, streamStatistics.FinishedAt).Date())
   logger.Infof("  avg TransmissionTime: <%d>ms", timingStatistics.TransmissionTime/1e6)
+}
+
+func (collector dataCollector) PrintReport() {
+  report := collector.GetTimingReport()
+  PrintTimingReport(report.DocumentReport, DOCUMENT)
+  PrintTimingReport(report.StylesheetReport, STYLESHEET)
+  PrintTimingReport(report.XhrReport, XHR)
+  PrintTimingReport(report.ScriptReport, SCRIPT)
+  PrintTimingReport(report.ImageReport, IMAGE)
+  PrintTimingReport(report.OtherReport, OTHER)
 }

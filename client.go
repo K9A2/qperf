@@ -33,46 +33,31 @@ func runAsClient() {
   logger.Infof("client: evaluation started at: %s\n",
     start.Format(time.UnixDate))
 
-  scheduler := config.Scheduler
   // 调整 root request 的状态为就绪状态
   rootRequestBlock := GetStreamControlBlockByUrl(
     config.ControlBlockSlice, config.RootRequestUrl)
   rootRequestBlock.EnqueuedAt = time.Now().UnixNano()
-  scheduler.PendingRequest = rootRequestBlock
   // 发起 root request
   go sendRequest(rootRequestBlock, tlsConfig)
 
+  // 发送剩下的请求
   for !ReplayFinished(config.ControlBlockSlice) {
     select {
-    case finished := <-config.SignalChan:
+    case availableRequests := <-config.StreamAvailableChan:
       {
-        config.Collector.AddNewFinishedStream(finished)
-        nextRequest := scheduler.PopNextRequest(config.ControlBlockSlice)
-        if nextRequest == nil {
-          // 全部请求回放完毕
-          logger.Info("all finished")
-          break
+        // 发送所有就绪的请求
+        for _, request := range *availableRequests {
+          go sendRequest(request, tlsConfig)
         }
-        nextRequest.StartedAt = time.Now().UnixNano()
-        // 在新起的 stream 上发送请求
-        go sendRequest(nextRequest, tlsConfig)
       }
     }
   }
 
+  // 实验已结束
   end := time.Now()
   logger.Infof("evaluation finished, time: <%.3f>s",
     float64(end.Sub(start).Milliseconds())/1000.0)
-
-  // 打印性能测试数据
-  report := config.Collector.GetTimingReport()
-  PrintTimingReport(report.DocumentReport, DOCUMENT)
-  PrintTimingReport(report.StylesheetReport, STYLESHEET)
-  PrintTimingReport(report.XhrReport, XHR)
-  PrintTimingReport(report.ScriptReport, SCRIPT)
-  PrintTimingReport(report.ImageReport, IMAGE)
-  PrintTimingReport(report.OtherReport, OTHER)
-
+  config.Collector.PrintReport()
 }
 
 // 与指定服务器建立链接
@@ -97,7 +82,8 @@ func sendRequest(block *StreamControlBlock, tlsConfig *tls.Config) {
   var err error
   if session == nil {
     // 还没有与此服务器建立连接
-    session, err = establishConnection(config.Address, serverMap[block.Domain].Port, tlsConfig)
+    session, err = establishConnection(
+      config.Address, serverMap[block.Domain].Port, tlsConfig)
     if err != nil {
       logger.Info("error in sending request, err: can not connect to server")
       return
@@ -105,12 +91,12 @@ func sendRequest(block *StreamControlBlock, tlsConfig *tls.Config) {
     sessionMap[block.Domain] = session
   }
 
-  // 创建完成本次请求所需要的 stream
   if session == nil {
     logger.Infof("got nil session, block <%s>, domain <%s>, port <%s>",
       block.RequestUrl, block.Domain, serverMap[block.Domain].Port)
     return
   }
+  // 在同一个 domain 的连接上起一个新的 stream 来承载此请求
   newStream, err := (*session).OpenStreamSync(context.Background())
   if err != nil {
     logger.Infof("error in open stream with domain <%s>, port <%s>, "+
@@ -169,10 +155,15 @@ func sendRequest(block *StreamControlBlock, tlsConfig *tls.Config) {
     return
   }
 
-  // stream 已完成，触发 stream 状态更新事件
-  config.Scheduler.OnStreamFinished(block, config.ControlBlockSlice)
-  // 向 signal chan 发送信号，以启动下一请求
-  config.SignalChan <- block
+  // 调整该请求状态为已完成状态
+  block.Status = FINISHED
+  // 计算结束时间和传输耗时
+  block.FinishedAt = time.Now().UnixNano()
+  block.QueuedFor = block.StartedAt - block.EnqueuedAt
+  block.TransmissionTime = block.FinishedAt - block.StartedAt
+
+  // 触发 scheduler 更新 stream 状态事件
+  config.Scheduler.OnStreamFinished(block)
 
   logger.Infof("request for resource id: <%d> finished, type: <%s>",
     block.ResourceId, block.ResourceType)

@@ -86,7 +86,7 @@ type programConfig struct {
   IterationCount int
   RootRequestUrl string
 
-  // 控制块，保存各 request 的信息
+  // 控制块，保存各 request 的信息，由所有需要修改 stream 状态的组件共享
   ControlBlockSlice *StreamControlBlockSlice
   // 默认使用 chrome dynamic fcfs 调度器
   Scheduler *DynamicFcfsScheduler
@@ -96,6 +96,8 @@ type programConfig struct {
   Collector *dataCollector
   // domain 名字与 id 之间的映射关系
   ServerControlBlockMap *map[string]*ServerControlBlock
+  // scheduler 向此 chan 中放入所有就绪的 stream
+  StreamAvailableChan chan *[]*StreamControlBlock
 
   // 关于 quic-go 的配置项
   StreamMultiplexLimit int // 每个 QUIC Packet 包能复用的最大 stream 数目
@@ -217,6 +219,7 @@ func BuildProgramConfig(options *Options) *programConfig {
   config.Collector = DataCollector(capacity)
   config.ServerControlBlockMap =
     BuildServerControlBlockSlice(&w.FilteredEntries)
+  config.StreamAvailableChan = make(chan *StreamControlBlock)
 
   return &config
 }
